@@ -393,7 +393,8 @@ impl Btf {
         Ok(types)
     }
 
-    pub(crate) fn string_at(&self, offset: u32) -> Result<Cow<'_, str>, BtfError> {
+    /// Returns the string at the given offset in the BTF string table.
+    pub fn string_at(&self, offset: u32) -> Result<Cow<'_, str>, BtfError> {
         let btf_header {
             hdr_len,
             mut str_off,
@@ -415,7 +416,8 @@ impl Btf {
         Ok(s.to_string_lossy())
     }
 
-    pub(crate) fn type_by_id(&self, type_id: u32) -> Result<&BtfType, BtfError> {
+    /// Returns the BTF type at the given type id.
+    pub fn type_by_id(&self, type_id: u32) -> Result<&BtfType, BtfError> {
         self.types.type_by_id(type_id)
     }
 
@@ -423,7 +425,8 @@ impl Btf {
         self.types.resolve_type(root_type_id)
     }
 
-    pub(crate) fn type_name(&self, ty: &BtfType) -> Result<Cow<'_, str>, BtfError> {
+    /// Returns the name of a BTF type.
+    pub fn type_name(&self, ty: &BtfType) -> Result<Cow<'_, str>, BtfError> {
         self.string_at(ty.name_offset())
     }
 
@@ -475,6 +478,21 @@ impl Btf {
         Err(BtfError::MaximumTypeDepthReached {
             type_id: root_type_id,
         })
+    }
+
+    /// Patches all GLOBAL functions to STATIC linkage.
+    ///
+    /// This is needed for `struct_ops` programs where the Rust compiler emits
+    /// all functions as `BTF_FUNC_GLOBAL`, but the BPF verifier rejects
+    /// global functions that return void.
+    pub fn fixup_func_linkage(&mut self) {
+        for t in &mut self.types.types {
+            if let BtfType::Func(func) = t {
+                if func.linkage() == FuncLinkage::Global {
+                    func.set_linkage(FuncLinkage::Static);
+                }
+            }
+        }
     }
 
     /// Encodes the metadata as BTF format
@@ -825,6 +843,19 @@ impl Object {
             if obj_btf.is_empty() {
                 return Ok(None);
             }
+
+            // For struct_ops objects, patch all GLOBAL functions to STATIC.
+            // The Rust compiler emits all functions as BTF_FUNC_GLOBAL, but the
+            // BPF verifier rejects global functions that return void. Since
+            // struct_ops functions are logically static (single compilation
+            // unit), this is always safe.
+            let has_struct_ops = self.programs.values().any(|p| {
+                matches!(p.section, crate::ProgramSection::StructOps { .. })
+            });
+            if has_struct_ops {
+                obj_btf.fixup_func_linkage();
+            }
+
             // fixup btf
             obj_btf.fixup_and_sanitize(
                 &self.section_infos,

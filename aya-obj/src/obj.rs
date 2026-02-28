@@ -30,7 +30,9 @@ use crate::{
         BPF_CALL, BPF_F_RDONLY_PROG, BPF_JMP, BPF_K, bpf_func_id, bpf_insn, bpf_map_info,
         bpf_map_type::BPF_MAP_TYPE_ARRAY,
     },
-    maps::{BtfMap, BtfMapDef, LegacyMap, MINIMUM_MAP_SIZE, Map, PinningType, bpf_map_def},
+    maps::{
+        self, BtfMap, BtfMapDef, LegacyMap, MINIMUM_MAP_SIZE, Map, PinningType, bpf_map_def,
+    },
     programs::{
         CgroupSockAddrAttachType, CgroupSockAttachType, CgroupSockoptAttachType, XdpAttachType,
     },
@@ -226,7 +228,6 @@ pub struct Function {
 /// - `action`
 /// - `sk_reuseport/migrate`, `sk_reuseport`
 /// - `syscall`
-/// - `struct_ops+`
 /// - `fmod_ret+`, `fmod_ret.s+`
 /// - `iter+`, `iter.s+`
 #[derive(Debug, Clone)]
@@ -283,6 +284,9 @@ pub enum ProgramSection {
     },
     CgroupDevice,
     Iter {
+        sleepable: bool,
+    },
+    StructOps {
         sleepable: bool,
     },
 }
@@ -438,6 +442,8 @@ impl FromStr for ProgramSection {
             "sk_lookup" => Self::SkLookup,
             "iter" => Self::Iter { sleepable: false },
             "iter.s" => Self::Iter { sleepable: true },
+            "struct_ops" => Self::StructOps { sleepable: false },
+            "struct_ops.s" => Self::StructOps { sleepable: true },
             _ => {
                 return Err(ParseError::InvalidProgramSection {
                     section: section.to_owned(),
@@ -839,6 +845,74 @@ impl Object {
         Ok(())
     }
 
+    fn parse_struct_ops_section(&mut self, section: &Section<'_>) -> Result<(), ParseError> {
+        let auto_attach = section.kind == EbpfSectionKind::StructOpsLink;
+
+        // Find the symbol for this section to get the struct name
+        let syms = self.symbols_by_section.get(&section.index).ok_or_else(|| {
+            ParseError::NoSymbolsForSection {
+                section_name: section.name.to_string(),
+            }
+        })?;
+
+        for symbol_index in syms {
+            let symbol = self
+                .symbol_table
+                .get(symbol_index)
+                .expect("all symbols in symbols_by_section are also in symbol_table");
+
+            let name = match symbol.name.as_ref() {
+                Some(name) if !name.is_empty() && symbol.kind == SymbolKind::Data => name,
+                _ => continue,
+            };
+
+            // Determine the struct type name from BTF if available
+            let struct_type_name = if let Some(btf) = &self.btf {
+                // Look up the BTF type for this variable
+                let mut found_type_name = None;
+                for t in btf.types() {
+                    if let BtfType::Var(var) = t {
+                        if let Ok(var_name) = btf.type_name(t) {
+                            if var_name == *name {
+                                // Follow the type to find the struct
+                                if let Ok(inner_type) = btf.type_by_id(var.btf_type) {
+                                    if let Ok(type_name) = btf.type_name(inner_type) {
+                                        found_type_name = Some(type_name.to_string());
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                found_type_name.unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let start = symbol.address as usize;
+            let end = start + symbol.size as usize;
+            let data = if end <= section.data.len() {
+                section.data[start..end].to_vec()
+            } else {
+                section.data.to_vec()
+            };
+
+            self.maps.insert(
+                name.clone(),
+                Map::StructOps(maps::StructOpsMap {
+                    section_index: section.index.0,
+                    symbol_index: *symbol_index,
+                    struct_type_name,
+                    data,
+                    auto_attach,
+                }),
+            );
+        }
+
+        Ok(())
+    }
+
     fn parse_section(&mut self, section: Section<'_>) -> Result<(), ParseError> {
         self.section_infos
             .insert(section.name.to_owned(), (section.index, section.size));
@@ -885,6 +959,9 @@ impl Object {
                             .collect(),
                     );
                 }
+            }
+            EbpfSectionKind::StructOps | EbpfSectionKind::StructOpsLink => {
+                self.parse_struct_ops_section(&section)?;
             }
             EbpfSectionKind::Undefined | EbpfSectionKind::License | EbpfSectionKind::Version => {}
         }
@@ -1044,6 +1121,10 @@ pub enum EbpfSectionKind {
     License,
     /// `version`
     Version,
+    /// `.struct_ops`
+    StructOps,
+    /// `.struct_ops.link`
+    StructOpsLink,
 }
 
 impl EbpfSectionKind {
@@ -1068,6 +1149,10 @@ impl EbpfSectionKind {
             Self::Btf
         } else if name == ".BTF.ext" {
             Self::BtfExt
+        } else if name.starts_with(".struct_ops.link") {
+            Self::StructOpsLink
+        } else if name.starts_with(".struct_ops") {
+            Self::StructOps
         } else {
             Self::Undefined
         }

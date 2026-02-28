@@ -489,10 +489,11 @@ macro_rules! define_link_wrapper {
 
         #[expect(clippy::allow_attributes, reason = "macro")]
         #[allow(dead_code, reason = "macro")]
+        #[allow(private_interfaces, reason = "macro")]
         // allow dead code since currently XDP/TC are the only consumers of inner and
         // into_inner
         impl $wrapper {
-            const fn new(base: $base) -> $wrapper {
+            pub(crate) const fn new(base: $base) -> $wrapper {
                 $wrapper(Some(base))
             }
 
