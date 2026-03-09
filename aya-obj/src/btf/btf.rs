@@ -496,10 +496,48 @@ impl Btf {
     }
 
     /// Encodes the metadata as BTF format
+    /// Encodes the metadata as BTF format.
+    ///
+    /// Sanitizes types that the kernel rejects during `BPF_BTF_LOAD`:
+    /// - EXTERN FUNCs are replaced with INT placeholders
+    /// - Unsupported DATASECs are replaced with INT placeholders
     pub fn to_bytes(&self) -> Vec<u8> {
+        // Serialize types, sanitizing problematic entries
+        let mut type_buf = Vec::new();
+        for ty in self.types() {
+            match ty {
+                BtfType::Func(func) if func.linkage() == FuncLinkage::Extern => {
+                    // Replace EXTERN FUNC with INT (same size: 12 bytes)
+                    let placeholder =
+                        BtfType::Int(Int::new(func.name_offset, 1, IntEncoding::None, 0));
+                    type_buf.extend(placeholder.to_bytes());
+                }
+                BtfType::DataSec(d) => {
+                    let name = self.string_at(d.name_offset).unwrap_or_default();
+                    if name == ".ksyms"
+                        || name == "license"
+                        || name.starts_with(".struct_ops")
+                    {
+                        // Replace unsupported DATASEC with INT placeholder
+                        let placeholder =
+                            BtfType::Int(Int::new(d.name_offset, 1, IntEncoding::None, 0));
+                        type_buf.extend(placeholder.to_bytes());
+                    } else {
+                        type_buf.extend(ty.to_bytes());
+                    }
+                }
+                _ => {
+                    type_buf.extend(ty.to_bytes());
+                }
+            }
+        }
+        let mut header = self.header;
+        header.type_len = type_buf.len() as u32;
+        header.str_off = header.type_len;
+        header.str_len = self.strings.len() as u32;
         // Safety: btf_header is POD
-        let mut buf = unsafe { bytes_of::<btf_header>(&self.header).to_vec() };
-        buf.extend(self.types.to_bytes());
+        let mut buf = unsafe { bytes_of::<btf_header>(&header).to_vec() };
+        buf.extend(type_buf);
         buf.put(self.strings.as_slice());
         buf
     }
@@ -586,9 +624,14 @@ impl Btf {
                         d.name_offset = self.add_string(&fixed_name);
                     }
 
-                    // There are some cases when the compiler does indeed populate the size.
                     if d.size > 0 {
                         debug!("{kind} {name}: size fixup not required");
+                    } else if name == ".ksyms"
+                        || name == "license"
+                        || name.starts_with(".struct_ops")
+                    {
+                        // Virtual sections without ELF backing; sanitized in to_bytes().
+                        debug!("{kind} {name}: skipping fixup (sanitized in to_bytes)");
                     } else {
                         // We need to get the size of the section from the ELF file.
                         // Fortunately, we cached these when parsing it initially
@@ -711,6 +754,9 @@ impl Btf {
                     if !features.btf_func {
                         debug!("{kind}: not supported. replacing with TYPEDEF");
                         *t = BtfType::Typedef(Typedef::new(ty.name_offset, ty.btf_type));
+                    } else if ty.linkage() == FuncLinkage::Extern {
+                        // Keep EXTERN FUNC in-memory for kfunc call resolution.
+                        // The to_bytes() method sanitizes them before kernel load.
                     } else if !features.btf_func_global
                         || name == "memset"
                         || name == "memcpy"
@@ -734,7 +780,6 @@ impl Btf {
                         }
                     }
                 }
-                // Sanitize FLOAT.
                 BtfType::Float(ty) if !features.btf_float => {
                     debug!("{kind}: not supported. replacing with STRUCT");
                     *t = BtfType::Struct(Struct::new(0, vec![], ty.size));
@@ -854,6 +899,31 @@ impl Object {
             });
             if has_struct_ops {
                 obj_btf.fixup_func_linkage();
+            }
+
+            // Capture kfunc BTF type_ids before sanitization replaces EXTERN
+            // FUNCs with INT placeholders. These ids are needed later by
+            // fixup_kfunc_calls to set the correct imm in kfunc call insns.
+            let mut extern_names: alloc::collections::BTreeSet<alloc::string::String> =
+                alloc::collections::BTreeSet::new();
+            for sym in self.symbol_table.values() {
+                if !sym.is_definition && sym.section_index.is_none() {
+                    if let Some(name) = &sym.name {
+                        extern_names.insert(name.clone());
+                    }
+                }
+            }
+            for (type_id, ty) in obj_btf.types().enumerate() {
+                if let BtfType::Func(func) = ty {
+                    if func.linkage() == FuncLinkage::Extern {
+                        if let Ok(name) = obj_btf.type_name(ty) {
+                            if extern_names.contains(name.as_ref()) {
+                                self.kfunc_btf_ids
+                                    .insert(name.into_owned(), type_id as u32);
+                            }
+                        }
+                    }
+                }
             }
 
             // fixup btf

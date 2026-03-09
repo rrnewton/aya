@@ -155,6 +155,8 @@ pub struct Object {
     // symbol_offset_by_name caches symbols that could be referenced from a
     // BTF VAR type so the offsets can be fixed up
     pub(crate) symbol_offset_by_name: HashMap<String, u64>,
+    /// Kfunc name → BTF type_id mapping, captured before BTF sanitization
+    pub kfunc_btf_ids: BTreeMap<String, u32>,
 }
 
 /// An eBPF program
@@ -541,6 +543,7 @@ impl Object {
             symbols_by_section: HashMap::new(),
             section_infos: HashMap::new(),
             symbol_offset_by_name: HashMap::new(),
+            kfunc_btf_ids: BTreeMap::new(),
         }
     }
 
@@ -973,6 +976,76 @@ impl Object {
     pub fn sanitize_functions(&mut self, features: &Features) {
         for function in self.functions.values_mut() {
             function.sanitize(features);
+        }
+    }
+
+    /// Fixes up kfunc call instructions by resolving BTF func IDs.
+    ///
+    /// After `relocate_calls` patches extern symbol calls to use
+    /// `BPF_PSEUDO_KFUNC_CALL`, this method resolves the `imm` field
+    /// to the correct BTF func type ID by matching the relocation
+    /// symbol name against vmlinux BTF FUNC entries.
+    ///
+    /// `kernel_btf` should be the vmlinux BTF loaded from `/sys/kernel/btf/vmlinux`.
+    pub fn fixup_kfunc_calls(&mut self, kernel_btf: &Btf) {
+        use crate::generated::{BPF_CALL, BPF_JMP, BPF_K, BPF_PSEUDO_KFUNC_CALL};
+
+        // Build a map of kfunc name → vmlinux BTF func type_id
+        let mut kfunc_vmlinux_ids: BTreeMap<String, u32> = BTreeMap::new();
+        for sym in self.symbol_table.values() {
+            if !sym.is_definition && sym.section_index.is_none() {
+                if let Some(name) = &sym.name {
+                    // Look up this extern symbol in vmlinux BTF
+                    if let Ok(btf_id) =
+                        kernel_btf.id_by_type_name_kind(name, crate::btf::BtfKind::Func)
+                    {
+                        kfunc_vmlinux_ids.insert(name.clone(), btf_id);
+                    }
+                }
+            }
+        }
+
+        if kfunc_vmlinux_ids.is_empty() {
+            return;
+        }
+
+        // Build relocation (section_index, offset) → symbol name map
+        let mut extern_call_names: BTreeMap<(usize, u64), String> = BTreeMap::new();
+        for (section_index, relocations) in &self.relocations {
+            for (offset, rel) in relocations {
+                if let Some(sym) = self.symbol_table.get(&rel.symbol_index) {
+                    if !sym.is_definition && sym.section_index.is_none() {
+                        if let Some(name) = &sym.name {
+                            extern_call_names
+                                .insert((section_index.0, *offset), name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Patch kfunc call instructions with vmlinux BTF func IDs
+        for function in self.functions.values_mut() {
+            for (ins_idx, ins) in function.instructions.iter_mut().enumerate() {
+                let klass = u32::from(ins.code & 0x07);
+                let op = u32::from(ins.code & 0xF0);
+                let src = u32::from(ins.code & 0x08);
+
+                if klass == BPF_JMP
+                    && op == BPF_CALL
+                    && src == BPF_K
+                    && u32::from(ins.src_reg()) == BPF_PSEUDO_KFUNC_CALL
+                {
+                    let offset =
+                        (function.section_offset + ins_idx * crate::relocation::INS_SIZE) as u64;
+                    let key = (function.section_index.0, offset);
+                    if let Some(name) = extern_call_names.get(&key) {
+                        if let Some(&vmlinux_id) = kfunc_vmlinux_ids.get(name) {
+                            ins.imm = vmlinux_id as i32;
+                        }
+                    }
+                }
+            }
         }
     }
 }
