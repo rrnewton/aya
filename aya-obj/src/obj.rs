@@ -155,8 +155,6 @@ pub struct Object {
     // symbol_offset_by_name caches symbols that could be referenced from a
     // BTF VAR type so the offsets can be fixed up
     pub(crate) symbol_offset_by_name: HashMap<String, u64>,
-    /// Kfunc name → BTF type_id mapping, captured before BTF sanitization
-    pub kfunc_btf_ids: BTreeMap<String, u32>,
 }
 
 /// An eBPF program
@@ -543,7 +541,6 @@ impl Object {
             symbols_by_section: HashMap::new(),
             section_infos: HashMap::new(),
             symbol_offset_by_name: HashMap::new(),
-            kfunc_btf_ids: BTreeMap::new(),
         }
     }
 
@@ -988,7 +985,7 @@ impl Object {
     ///
     /// `kernel_btf` should be the vmlinux BTF loaded from `/sys/kernel/btf/vmlinux`.
     pub fn fixup_kfunc_calls(&mut self, kernel_btf: &Btf) {
-        use crate::generated::{BPF_CALL, BPF_JMP, BPF_K, BPF_PSEUDO_KFUNC_CALL};
+        use crate::generated::BPF_PSEUDO_KFUNC_CALL;
 
         // Build a map of kfunc name → vmlinux BTF func type_id
         let mut kfunc_vmlinux_ids: BTreeMap<String, u32> = BTreeMap::new();
@@ -1037,7 +1034,7 @@ impl Object {
                     && u32::from(ins.src_reg()) == BPF_PSEUDO_KFUNC_CALL
                 {
                     let offset =
-                        (function.section_offset + ins_idx * crate::relocation::INS_SIZE) as u64;
+                        (function.section_offset + ins_idx * INS_SIZE) as u64;
                     let key = (function.section_index.0, offset);
                     if let Some(name) = extern_call_names.get(&key) {
                         if let Some(&vmlinux_id) = kfunc_vmlinux_ids.get(name) {

@@ -28,13 +28,12 @@ use crate::{
         struct_ops::StructOpsLink,
     },
     sys::{
-        bpf_create_map, bpf_link_create, bpf_load_btf, bpf_map_update_elem_ptr,
-        is_bpf_cookie_supported, is_bpf_global_data_supported, is_btf_datasec_supported,
-        is_btf_datasec_zero_supported, is_btf_decl_tag_supported, is_btf_enum64_supported,
-        is_btf_float_supported, is_btf_func_global_supported, is_btf_func_supported,
-        is_btf_supported, is_btf_type_tag_supported, is_perf_link_supported,
-        is_probe_read_kernel_supported, is_prog_id_supported, is_prog_name_supported,
-        retry_with_verifier_logs, LinkTarget,
+        bpf_link_create, bpf_load_btf, bpf_map_update_elem_ptr, is_bpf_cookie_supported,
+        is_bpf_global_data_supported, is_btf_datasec_supported, is_btf_datasec_zero_supported,
+        is_btf_decl_tag_supported, is_btf_enum64_supported, is_btf_float_supported,
+        is_btf_func_global_supported, is_btf_func_supported, is_btf_supported,
+        is_btf_type_tag_supported, is_perf_link_supported, is_probe_read_kernel_supported,
+        is_prog_id_supported, is_prog_name_supported, retry_with_verifier_logs, LinkTarget,
     },
     util::{bytes_of, bytes_of_slice, nr_cpus, page_size},
 };
@@ -96,32 +95,6 @@ pub fn features() -> &'static Features {
     &FEATURES
 }
 
-/// A kfunc parameter type for BTF generation.
-#[derive(Debug, Clone)]
-pub enum KfuncParamType {
-    /// A pointer to data (represented as `*mut u8` or similar)
-    Ptr,
-    /// An unsigned 64-bit integer
-    U64,
-    /// A signed 64-bit integer
-    I64,
-    /// An unsigned 32-bit integer
-    U32,
-    /// A signed 32-bit integer
-    I32,
-    /// A boolean value
-    Bool,
-}
-
-/// A kfunc signature for BTF generation.
-#[derive(Debug, Clone)]
-pub struct KfuncSignature {
-    /// The parameter types
-    pub params: Vec<KfuncParamType>,
-    /// The return type (None for void)
-    pub ret: Option<KfuncParamType>,
-}
-
 /// Builder style API for advanced loading of eBPF programs.
 ///
 /// Loading eBPF code involves a few steps, including loading maps and applying
@@ -158,7 +131,6 @@ pub struct EbpfLoader<'a> {
     extensions: HashSet<&'a str>,
     verifier_log_level: VerifierLogLevel,
     allow_unsupported_maps: bool,
-    kfuncs: Vec<(String, KfuncSignature)>,
 }
 
 /// Builder style API for advanced loading of eBPF programs.
@@ -198,7 +170,6 @@ impl<'a> EbpfLoader<'a> {
             extensions: HashSet::new(),
             verifier_log_level: VerifierLogLevel::default(),
             allow_unsupported_maps: false,
-            kfuncs: Vec::new(),
         }
     }
 
@@ -395,31 +366,6 @@ impl<'a> EbpfLoader<'a> {
         self
     }
 
-    /// Registers a kernel function (kfunc) for BTF generation.
-    ///
-    /// When loading `struct_ops` programs that call kernel functions via inline
-    /// assembly, the BTF must contain extern function declarations and a
-    /// `.ksyms` DATASEC referencing them. This method registers a kfunc so
-    /// that aya generates the required BTF entries automatically.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use aya::{EbpfLoader, KfuncSignature, KfuncParamType};
-    ///
-    /// let bpf = EbpfLoader::new()
-    ///     .register_kfunc("scx_bpf_dsq_insert", KfuncSignature {
-    ///         params: vec![KfuncParamType::Ptr, KfuncParamType::U64, KfuncParamType::U64, KfuncParamType::U64],
-    ///         ret: None,
-    ///     })
-    ///     .load_file("file.o")?;
-    /// # Ok::<(), aya::EbpfError>(())
-    /// ```
-    pub fn register_kfunc(&mut self, name: &str, signature: KfuncSignature) -> &mut Self {
-        self.kfuncs.push((name.to_owned(), signature));
-        self
-    }
-
     /// Sets BPF verifier log level.
     ///
     /// # Example
@@ -482,17 +428,9 @@ impl<'a> EbpfLoader<'a> {
             verifier_log_level,
             allow_unsupported_maps,
             map_pin_path_by_name,
-            kfuncs,
         } = self;
         let mut obj = Object::parse(data)?;
         obj.patch_map_data(globals.clone())?;
-
-        // Apply kfunc registrations to the object's BTF
-        if !kfuncs.is_empty() {
-            if let Some(btf) = &mut obj.btf {
-                apply_kfunc_registrations(btf, kfuncs);
-            }
-        }
 
         let btf_fd = if let Some(features) = &FEATURES.btf() {
             if let Some(btf) = obj.fixup_and_sanitize_btf(features)? {
@@ -1264,7 +1202,7 @@ impl Ebpf {
     /// Returns a [`StructOpsLink`] that keeps the `struct_ops` attached. Dropping
     /// the link detaches the `struct_ops`.
     pub fn attach_struct_ops(&mut self, map_name: &str) -> Result<StructOpsLink, EbpfError> {
-        use aya_obj::generated::bpf_attach_type::BPF_STRUCT_OPS;
+        use aya_obj::generated::{bpf_attach_type, bpf_attr};
 
         let struct_ops_obj = self
             .struct_ops_maps
@@ -1282,16 +1220,14 @@ impl Ebpf {
             }
         };
 
-        // Load kernel BTF to find the struct type
+        // Use the kernel BTF captured during load, or load it now as fallback
         let kernel_btf = Btf::from_sys_fs().map_err(EbpfError::BtfError)?;
 
-        // Find the struct type in kernel BTF
+        // Look up inner struct and wrapper struct in vmlinux BTF
         let vmlinux_type_id = kernel_btf
             .id_by_type_name_kind(&struct_type_name, BtfKind::Struct)
             .map_err(EbpfError::BtfError)?;
 
-        // Find the wrapper struct (bpf_struct_ops_{name}) — its BTF ID is
-        // what the kernel expects as btf_vmlinux_value_type_id for map creation.
         let wrapper_name = format!("bpf_struct_ops_{struct_type_name}");
         let vmlinux_value_type_id = kernel_btf
             .id_by_type_name_kind(&wrapper_name, BtfKind::Struct)
@@ -1301,12 +1237,8 @@ impl Ebpf {
                 ))
             })?;
 
-        let struct_type = kernel_btf
-            .type_by_id(vmlinux_type_id)
-            .map_err(EbpfError::BtfError)?;
-
-        let (struct_size, members) = match struct_type {
-            BtfType::Struct(s) => (s.size, &s.members),
+        let members = match kernel_btf.type_by_id(vmlinux_type_id).map_err(EbpfError::BtfError)? {
+            BtfType::Struct(s) => &s.members,
             other => {
                 return Err(EbpfError::StructOpsError(format!(
                     "expected struct type for {struct_type_name}, got {other:?}",
@@ -1314,76 +1246,39 @@ impl Ebpf {
             }
         };
 
-        // Get the wrapper struct to find value_size and data offset
-        let wrapper_type = kernel_btf
+        // Get wrapper struct size and data field offset
+        let (wrapper_size, data_offset) = match kernel_btf
             .type_by_id(vmlinux_value_type_id)
-            .map_err(EbpfError::BtfError)?;
-        let (wrapper_size, data_offset) = match wrapper_type {
+            .map_err(EbpfError::BtfError)?
+        {
             BtfType::Struct(s) => {
-                // Find the 'data' member offset
-                let mut data_off = 0u32;
-                for m in &s.members {
+                let data_off = s.members.iter().find_map(|m| {
                     let name = kernel_btf.string_at(m.name_offset).unwrap_or_default();
-                    if name == "data" {
-                        data_off = m.offset / 8;
-                        break;
-                    }
-                }
-                (s.size, data_off)
+                    (name == "data").then_some(m.offset / 8)
+                }).unwrap_or(0);
+                (s.size, data_off as usize)
             }
-            _ => (struct_size, 0),
+            _ => return Err(EbpfError::StructOpsError(format!(
+                "wrapper struct {wrapper_name} is not a struct"
+            ))),
         };
 
-        // Load all struct_ops programs and collect their FDs.
-        // Match programs to struct members by name.
-        let mut prog_fds: HashMap<String, i32> = HashMap::new();
-        for (prog_name, program) in &mut self.programs {
-            if let Program::StructOps(struct_ops_prog) = program {
-                // Try to find a matching member in the kernel struct
-                for (member_idx, member) in members.iter().enumerate() {
-                    let member_name = kernel_btf
-                        .string_at(member.name_offset)
-                        .unwrap_or_default();
-                    if member_name != *prog_name {
-                        continue;
-                    }
-                    // Check if this member is a function pointer
-                    if let Ok(member_type) = kernel_btf.type_by_id(member.btf_type) {
-                        if matches!(member_type, BtfType::Ptr(_)) {
-                            // For struct_ops programs:
-                            // - attach_btf_id = vmlinux struct type id
-                            // - expected_attach_type = member index within the struct
-                            struct_ops_prog.data.expected_attach_type = Some(
-                                unsafe { core::mem::transmute::<u32, aya_obj::generated::bpf_attach_type>(member_idx as u32) },
-                            );
-                            struct_ops_prog.load(vmlinux_type_id)?;
-                            let fd = struct_ops_prog.fd()?;
-                            prog_fds
-                                .insert(prog_name.clone(), fd.as_fd().as_raw_fd());
-                        }
-                    }
-                    break;
-                }
-            }
-        }
+        // Load struct_ops programs, matching each to a struct member by name
+        let prog_fds = self.load_struct_ops_programs(
+            &kernel_btf, members, vmlinux_type_id,
+        )?;
 
-        // Build the map value buffer (wrapper struct size, with data at data_offset)
+        // Build the map value: wrapper-sized buffer with section data at data_offset
         let mut value = vec![0u8; wrapper_size as usize];
-        // Copy section data (scalar field initial values) into the data portion
-        let data_off = data_offset as usize;
-        let copy_len = section_data.len().min(value.len() - data_off);
-        value[data_off..data_off + copy_len]
+        let copy_len = section_data.len().min(value.len() - data_offset);
+        value[data_offset..data_offset + copy_len]
             .copy_from_slice(&section_data[..copy_len]);
 
-        // For function pointer fields, write the program FD at the correct offset
-        // (member offsets are relative to the inner struct, add data_offset)
+        // Write loaded program FDs into function pointer field positions
         for member in members {
-            let member_name = kernel_btf
-                .string_at(member.name_offset)
-                .unwrap_or_default();
-
+            let member_name = kernel_btf.string_at(member.name_offset).unwrap_or_default();
             if let Some(&fd) = prog_fds.get(member_name.as_ref()) {
-                let offset = data_off + (member.offset / 8) as usize;
+                let offset = data_offset + (member.offset / 8) as usize;
                 if let Ok(member_type) = kernel_btf.type_by_id(member.btf_type) {
                     if matches!(member_type, BtfType::Ptr(_)) && offset + 4 <= value.len() {
                         value[offset..offset + 4]
@@ -1393,13 +1288,11 @@ impl Ebpf {
             }
         }
 
-        // Create the struct_ops map with btf_vmlinux_value_type_id
+        // Create the struct_ops BPF map
         let c_name = std::ffi::CString::new(map_name).map_err(|e| {
-            EbpfError::StructOpsError(format!("invalid map name: {map_name}: {e}"))
+            EbpfError::StructOpsError(format!("invalid map name: {e}"))
         })?;
-
         let map_fd = {
-            use aya_obj::generated::bpf_attr;
             let mut attr = unsafe { std::mem::zeroed::<bpf_attr>() };
             let u = unsafe { &mut attr.__bindgen_anon_1 };
             u.map_type = bpf_map_type::BPF_MAP_TYPE_STRUCT_OPS as u32;
@@ -1411,40 +1304,80 @@ impl Ebpf {
             if let Some(btf_fd) = &self.btf_fd {
                 u.btf_fd = btf_fd.as_fd().as_raw_fd() as u32;
             }
-
             let name_bytes = c_name.to_bytes();
             let len = name_bytes.len().min(u.map_name.len() - 1);
             u.map_name[..len].copy_from_slice(unsafe {
                 std::mem::transmute::<&[u8], &[std::ffi::c_char]>(&name_bytes[..len])
             });
-
             crate::sys::bpf_map_create(&mut attr).map_err(|io_error| {
-                EbpfError::StructOpsError(format!(
-                    "failed to create struct_ops map: {io_error}"
-                ))
+                EbpfError::StructOpsError(format!("failed to create struct_ops map: {io_error}"))
             })?
         };
 
-        // Update the map with our value
+        // Populate the map value
         bpf_map_update_elem_ptr(map_fd.as_fd(), &0u32, value.as_mut_ptr(), 0).map_err(
             |io_error| {
-                EbpfError::StructOpsError(format!(
-                    "failed to update struct_ops map: {io_error}"
-                ))
+                EbpfError::StructOpsError(format!("failed to update struct_ops map: {io_error}"))
             },
         )?;
 
-        // Attach via BPF_LINK_CREATE
-        // For struct_ops, the map_fd goes in the prog_fd position
-        let link_fd =
-            bpf_link_create(map_fd.as_fd(), LinkTarget::Iter, BPF_STRUCT_OPS, 0, None)
-                .map_err(|io_error| {
-                    EbpfError::StructOpsError(format!(
-                        "failed to attach struct_ops: {io_error}"
-                    ))
-                })?;
+        // Attach via BPF_LINK_CREATE (map fd goes in prog_fd position)
+        let link_fd = bpf_link_create(
+            map_fd.as_fd(),
+            LinkTarget::Iter,
+            bpf_attach_type::BPF_STRUCT_OPS,
+            0,
+            None,
+        )
+        .map_err(|io_error| {
+            EbpfError::StructOpsError(format!("failed to attach struct_ops: {io_error}"))
+        })?;
 
-        Ok(StructOpsLink::new(FdLink::new(link_fd)))
+        Ok(StructOpsLink::wrap(FdLink::new(link_fd)))
+    }
+
+    /// Loads struct_ops programs, matching each to a kernel struct member by
+    /// name. Returns a map of member name to loaded program fd.
+    fn load_struct_ops_programs(
+        &mut self,
+        kernel_btf: &Btf,
+        members: &[aya_obj::btf::BtfMember],
+        vmlinux_type_id: u32,
+    ) -> Result<HashMap<String, i32>, EbpfError> {
+        let mut prog_fds: HashMap<String, i32> = HashMap::new();
+        for (prog_name, program) in &mut self.programs {
+            if let Program::StructOps(struct_ops_prog) = program {
+                for (member_idx, member) in members.iter().enumerate() {
+                    let member_name = kernel_btf
+                        .string_at(member.name_offset)
+                        .unwrap_or_default();
+                    if member_name != *prog_name {
+                        continue;
+                    }
+                    if let Ok(member_type) = kernel_btf.type_by_id(member.btf_type) {
+                        if matches!(member_type, BtfType::Ptr(_)) {
+                            // expected_attach_type = member index (u32 reinterpreted
+                            // as bpf_attach_type by the kernel)
+                            struct_ops_prog.data.expected_attach_type = Some(
+                                // SAFETY: the kernel interprets this field as a raw u32
+                                // member index for struct_ops programs, not as a real
+                                // bpf_attach_type enum variant.
+                                unsafe {
+                                    core::mem::transmute::<u32, aya_obj::generated::bpf_attach_type>(
+                                        member_idx as u32,
+                                    )
+                                },
+                            );
+                            struct_ops_prog.load(vmlinux_type_id)?;
+                            let fd = struct_ops_prog.fd()?;
+                            prog_fds.insert(prog_name.clone(), fd.as_fd().as_raw_fd());
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(prog_fds)
     }
 }
 
@@ -1547,80 +1480,5 @@ impl<'a, T: Pod> From<&'a T> for GlobalData<'a> {
             // Safety: v is Pod
             bytes: bytes_of(v),
         }
-    }
-}
-
-/// Applies kfunc registrations to the object's BTF.
-///
-/// For each registered kfunc, this adds:
-/// - `BTF_KIND_INT` types for parameter/return types (if not already present)
-/// - A `BTF_KIND_FUNC_PROTO` with the parameter types
-/// - A `BTF_KIND_FUNC` with `BTF_FUNC_EXTERN` linkage
-/// - A `.ksyms` `BTF_KIND_DATASEC` referencing all kfunc FUNCs
-fn apply_kfunc_registrations(
-    btf: &mut Btf,
-    kfuncs: &[(String, KfuncSignature)],
-) {
-    use aya_obj::btf::{BtfParam, Func, FuncLinkage, FuncProto, Int, IntEncoding};
-
-    // Helper to get or create a BTF type for a kfunc param type
-    let void_type_id = 0u32; // type_id 0 is void
-
-    // Create basic type IDs we'll need
-    let u64_name = btf.add_string("unsigned long long");
-    let u64_type_id = btf.add_type(BtfType::Int(Int::new(u64_name, 8, IntEncoding::None, 0)));
-
-    let i64_name = btf.add_string("long long");
-    let i64_type_id = btf.add_type(BtfType::Int(Int::new(i64_name, 8, IntEncoding::Signed, 0)));
-
-    let u32_name = btf.add_string("unsigned int");
-    let u32_type_id = btf.add_type(BtfType::Int(Int::new(u32_name, 4, IntEncoding::None, 0)));
-
-    let i32_name = btf.add_string("int");
-    let i32_type_id = btf.add_type(BtfType::Int(Int::new(i32_name, 4, IntEncoding::Signed, 0)));
-
-    let bool_name = btf.add_string("_Bool");
-    let bool_type_id = btf.add_type(BtfType::Int(Int::new(bool_name, 1, IntEncoding::Bool, 0)));
-
-    // For pointer params, we use a void pointer (ptr to void = type 0)
-    let ptr_type_id =
-        btf.add_type(BtfType::Ptr(aya_obj::btf::Ptr::new(0, void_type_id)));
-
-    let param_type_id = |param: &KfuncParamType| -> u32 {
-        match param {
-            KfuncParamType::Ptr => ptr_type_id,
-            KfuncParamType::U64 => u64_type_id,
-            KfuncParamType::I64 => i64_type_id,
-            KfuncParamType::U32 => u32_type_id,
-            KfuncParamType::I32 => i32_type_id,
-            KfuncParamType::Bool => bool_type_id,
-        }
-    };
-
-    for (name, sig) in kfuncs {
-        // Build parameter list
-        let params: Vec<BtfParam> = sig
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let param_name = btf.add_string(&format!("p{i}"));
-                BtfParam {
-                    name_offset: param_name,
-                    btf_type: param_type_id(p),
-                }
-            })
-            .collect();
-
-        // Return type
-        let ret_type_id = sig.ret.as_ref().map_or(void_type_id, &param_type_id);
-
-        // Add FUNC_PROTO
-        let func_proto_id =
-            btf.add_type(BtfType::FuncProto(FuncProto::new(params, ret_type_id)));
-
-        // Add FUNC with EXTERN linkage
-        let func_name = btf.add_string(name);
-        btf.add_type(BtfType::Func(Func::new(func_name, func_proto_id, FuncLinkage::Extern)));
     }
 }

@@ -495,7 +495,6 @@ impl Btf {
         }
     }
 
-    /// Encodes the metadata as BTF format
     /// Encodes the metadata as BTF format.
     ///
     /// Sanitizes types that the kernel rejects during `BPF_BTF_LOAD`:
@@ -901,31 +900,6 @@ impl Object {
                 obj_btf.fixup_func_linkage();
             }
 
-            // Capture kfunc BTF type_ids before sanitization replaces EXTERN
-            // FUNCs with INT placeholders. These ids are needed later by
-            // fixup_kfunc_calls to set the correct imm in kfunc call insns.
-            let mut extern_names: alloc::collections::BTreeSet<alloc::string::String> =
-                alloc::collections::BTreeSet::new();
-            for sym in self.symbol_table.values() {
-                if !sym.is_definition && sym.section_index.is_none() {
-                    if let Some(name) = &sym.name {
-                        extern_names.insert(name.clone());
-                    }
-                }
-            }
-            for (type_id, ty) in obj_btf.types().enumerate() {
-                if let BtfType::Func(func) = ty {
-                    if func.linkage() == FuncLinkage::Extern {
-                        if let Ok(name) = obj_btf.type_name(ty) {
-                            if extern_names.contains(name.as_ref()) {
-                                self.kfunc_btf_ids
-                                    .insert(name.into_owned(), type_id as u32);
-                            }
-                        }
-                    }
-                }
-            }
-
             // fixup btf
             obj_btf.fixup_and_sanitize(
                 &self.section_infos,
@@ -1212,6 +1186,7 @@ impl Default for BtfTypes {
 }
 
 impl BtfTypes {
+    #[allow(dead_code, reason = "retained for potential future use")]
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![];
         for t in self.types.iter().skip(1) {

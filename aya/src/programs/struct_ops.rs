@@ -44,3 +44,9 @@ impl StructOps {
 }
 
 define_link_wrapper!(StructOpsLink, StructOpsLinkId, FdLink, FdLinkId, StructOps);
+
+impl StructOpsLink {
+    pub(crate) const fn wrap(base: FdLink) -> Self {
+        Self(Some(base))
+    }
+}
