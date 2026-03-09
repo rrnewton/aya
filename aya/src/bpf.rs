@@ -776,6 +776,7 @@ impl<'a> EbpfLoader<'a> {
             programs,
             struct_ops_maps,
             btf_fd: btf_fd.clone(),
+            kernel_btf: btf.as_deref().cloned(),
         })
     }
 }
@@ -942,6 +943,7 @@ pub struct Ebpf {
     programs: HashMap<String, Program>,
     struct_ops_maps: HashMap<String, aya_obj::Map>,
     btf_fd: Option<Arc<crate::MockableFd>>,
+    kernel_btf: Option<Btf>,
 }
 
 /// The main entry point into the library, used to work with eBPF programs and maps.
@@ -1220,8 +1222,8 @@ impl Ebpf {
             }
         };
 
-        // Use the kernel BTF captured during load, or load it now as fallback
-        let kernel_btf = Btf::from_sys_fs().map_err(EbpfError::BtfError)?;
+        // Clone kernel BTF before taking &mut self for program loading
+        let kernel_btf = self.kernel_btf.clone().ok_or(EbpfError::NoBTF)?;
 
         // Look up inner struct and wrapper struct in vmlinux BTF
         let vmlinux_type_id = kernel_btf
