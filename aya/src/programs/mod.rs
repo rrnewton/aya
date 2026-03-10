@@ -67,6 +67,7 @@ pub mod sk_reuseport;
 pub mod sk_skb;
 pub mod sock_ops;
 pub mod socket_filter;
+pub mod struct_ops;
 pub mod tc;
 pub mod tp_btf;
 pub mod trace_point;
@@ -121,6 +122,7 @@ pub use crate::programs::{
     sk_skb::{SkSkb, SkSkbKind},
     sock_ops::SockOps,
     socket_filter::{SocketFilter, SocketFilterError},
+    struct_ops::StructOps,
     tc::{SchedClassifier, TcAttachType, TcError},
     tp_btf::BtfTracePoint,
     trace_point::{TracePoint, TracePointError},
@@ -344,6 +346,8 @@ pub enum Program {
     CgroupDevice(CgroupDevice),
     /// An [`Iter`] program
     Iter(Iter),
+    /// A [`StructOps`] program
+    StructOps(StructOps),
 }
 
 impl Program {
@@ -385,6 +389,7 @@ impl Program {
             Self::CgroupSock(_) => ProgramType::CgroupSock,
             Self::CgroupDevice(_) => ProgramType::CgroupDevice,
             Self::FlowDissector(_) => ProgramType::FlowDissector,
+            Self::StructOps(_) => ProgramType::StructOps,
         }
     }
 
@@ -419,6 +424,7 @@ impl Program {
             Self::CgroupSock(p) => p.pin(path),
             Self::CgroupDevice(p) => p.pin(path),
             Self::Iter(p) => p.pin(path),
+            Self::StructOps(p) => p.pin(path),
         }
     }
 
@@ -453,6 +459,7 @@ impl Program {
             Self::CgroupSock(mut p) => p.unload(),
             Self::CgroupDevice(mut p) => p.unload(),
             Self::Iter(mut p) => p.unload(),
+            Self::StructOps(mut p) => p.unload(),
         }
     }
 
@@ -489,6 +496,7 @@ impl Program {
             Self::CgroupSock(p) => p.fd(),
             Self::CgroupDevice(p) => p.fd(),
             Self::Iter(p) => p.fd(),
+            Self::StructOps(p) => p.fd(),
         }
     }
 
@@ -526,6 +534,7 @@ impl Program {
             Self::CgroupSock(p) => p.info(),
             Self::CgroupDevice(p) => p.info(),
             Self::Iter(p) => p.info(),
+            Self::StructOps(p) => p.info(),
         }
     }
 }
@@ -849,6 +858,7 @@ impl_program_unload!(
     CgroupSock,
     CgroupDevice,
     Iter,
+    StructOps,
 );
 
 macro_rules! impl_fd {
@@ -893,6 +903,7 @@ impl_fd!(
     CgroupSock,
     CgroupDevice,
     Iter,
+    StructOps,
 );
 
 /// Trait implemented by the [`Program`] types which support the kernel's
@@ -1002,6 +1013,7 @@ impl_program_pin!(
     CgroupSock,
     CgroupDevice,
     Iter,
+    StructOps,
 );
 
 macro_rules! impl_from_pin {
@@ -1042,6 +1054,7 @@ impl_from_pin!(
     SockOps,
     CgroupDevice,
     Iter,
+    StructOps,
 );
 
 macro_rules! impl_from_prog_info {
@@ -1151,6 +1164,7 @@ impl_from_prog_info!(
     SkReuseport attach_type : SkReuseportAttachType,
     CgroupDevice,
     Iter,
+    StructOps,
 );
 
 macro_rules! impl_try_from_program {
@@ -1210,6 +1224,7 @@ impl_try_from_program!(
     CgroupSock,
     CgroupDevice,
     Iter,
+    StructOps,
 );
 
 impl_info!(
@@ -1241,6 +1256,7 @@ impl_info!(
     CgroupSock,
     CgroupDevice,
     Iter,
+    StructOps,
 );
 
 /// Returns an iterator over all loaded links.
