@@ -514,7 +514,6 @@ impl Btf {
                 BtfType::DataSec(d) => {
                     let name = self.string_at(d.name_offset).unwrap_or_default();
                     if name == ".ksyms"
-                        || name == "license"
                         || name.starts_with(".struct_ops")
                     {
                         // Replace unsupported DATASEC with INT placeholder
@@ -626,7 +625,6 @@ impl Btf {
                     if d.size > 0 {
                         debug!("{kind} {name}: size fixup not required");
                     } else if name == ".ksyms"
-                        || name == "license"
                         || name.starts_with(".struct_ops")
                     {
                         // Virtual sections without ELF backing; sanitized in to_bytes().
@@ -2076,5 +2074,134 @@ mod tests {
         // Ensure we can convert to bytes and back again.
         let raw = btf.to_bytes();
         Btf::parse(&raw, Endianness::default()).unwrap();
+    }
+
+    #[test]
+    fn test_fixup_func_linkage_global_to_static() {
+        let mut btf = Btf::new();
+        let name = btf.add_string("my_func");
+        let _proto_name = btf.add_string("");
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let proto_id = btf.add_type(BtfType::FuncProto(FuncProto::new(vec![], int_id)));
+        let func_id = btf.add_type(BtfType::Func(Func::new(name, proto_id, FuncLinkage::Global)));
+
+        btf.fixup_func_linkage();
+
+        assert_matches!(btf.type_by_id(func_id).unwrap(), BtfType::Func(f) => {
+            assert_eq!(f.linkage(), FuncLinkage::Static);
+        });
+    }
+
+    #[test]
+    fn test_fixup_func_linkage_leaves_static_alone() {
+        let mut btf = Btf::new();
+        let name = btf.add_string("my_func");
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let proto_id = btf.add_type(BtfType::FuncProto(FuncProto::new(vec![], int_id)));
+        let func_id = btf.add_type(BtfType::Func(Func::new(name, proto_id, FuncLinkage::Static)));
+
+        btf.fixup_func_linkage();
+
+        assert_matches!(btf.type_by_id(func_id).unwrap(), BtfType::Func(f) => {
+            assert_eq!(f.linkage(), FuncLinkage::Static);
+        });
+    }
+
+    #[test]
+    fn test_fixup_func_linkage_leaves_extern_alone() {
+        let mut btf = Btf::new();
+        let name = btf.add_string("kfunc");
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let proto_id = btf.add_type(BtfType::FuncProto(FuncProto::new(vec![], int_id)));
+        let func_id = btf.add_type(BtfType::Func(Func::new(name, proto_id, FuncLinkage::Extern)));
+
+        btf.fixup_func_linkage();
+
+        assert_matches!(btf.type_by_id(func_id).unwrap(), BtfType::Func(f) => {
+            assert_eq!(f.linkage(), FuncLinkage::Extern);
+        });
+    }
+
+    #[test]
+    fn test_to_bytes_sanitizes_extern_func() {
+        let mut btf = Btf::new();
+        let name = btf.add_string("my_kfunc");
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let proto_id = btf.add_type(BtfType::FuncProto(FuncProto::new(vec![], int_id)));
+        let func_id = btf.add_type(BtfType::Func(Func::new(name, proto_id, FuncLinkage::Extern)));
+
+        // In-memory: still EXTERN
+        assert_matches!(btf.type_by_id(func_id).unwrap(), BtfType::Func(f) => {
+            assert_eq!(f.linkage(), FuncLinkage::Extern);
+        });
+
+        // Serialized: should be parseable (EXTERN replaced with INT)
+        let raw = btf.to_bytes();
+        let parsed = Btf::parse(&raw, Endianness::default()).unwrap();
+
+        // The EXTERN FUNC should have been replaced with INT in serialized form
+        assert_matches!(parsed.type_by_id(func_id).unwrap(), BtfType::Int(_));
+    }
+
+    #[test]
+    fn test_to_bytes_sanitizes_struct_ops_datasec() {
+        let mut btf = Btf::new();
+        let sec_name = btf.add_string(".struct_ops.link");
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let var_name = btf.add_string("ops");
+        let var_id = btf.add_type(BtfType::Var(Var::new(var_name, int_id, VarLinkage::Global)));
+        let datasec_id = btf.add_type(BtfType::DataSec(DataSec::new(sec_name, vec![
+            DataSecEntry { btf_type: var_id, offset: 0, size: 4 },
+        ], 4)));
+
+        // Serialized: should be parseable (DATASEC replaced with INT)
+        let raw = btf.to_bytes();
+        let parsed = Btf::parse(&raw, Endianness::default()).unwrap();
+        assert_matches!(parsed.type_by_id(datasec_id).unwrap(), BtfType::Int(_));
+    }
+
+    #[test]
+    fn test_to_bytes_preserves_normal_datasec() {
+        let mut btf = Btf::new();
+        let sec_name = btf.add_string(".data");
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let var_name = btf.add_string("my_var");
+        let var_id = btf.add_type(BtfType::Var(Var::new(var_name, int_id, VarLinkage::Global)));
+        let datasec_id = btf.add_type(BtfType::DataSec(DataSec::new(sec_name, vec![
+            DataSecEntry { btf_type: var_id, offset: 0, size: 4 },
+        ], 4)));
+
+        // Normal .data DATASEC should NOT be replaced
+        let raw = btf.to_bytes();
+        let parsed = Btf::parse(&raw, Endianness::default()).unwrap();
+        assert_matches!(parsed.type_by_id(datasec_id).unwrap(), BtfType::DataSec(_));
+    }
+
+    #[test]
+    fn test_to_bytes_header_consistency() {
+        // Verify that to_bytes produces a BTF blob where header sizes match actual content
+        let mut btf = Btf::new();
+        let sec_name = btf.add_string(".struct_ops.link");
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let var_name = btf.add_string("ops");
+        let var_id = btf.add_type(BtfType::Var(Var::new(var_name, int_id, VarLinkage::Global)));
+        btf.add_type(BtfType::DataSec(DataSec::new(sec_name, vec![
+            DataSecEntry { btf_type: var_id, offset: 0, size: 4 },
+        ], 4)));
+
+        let raw = btf.to_bytes();
+
+        // Parse the header and verify consistency
+        let header: btf_header = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
+        let expected_len = header.hdr_len as usize + header.type_len as usize + header.str_len as usize;
+        assert_eq!(raw.len(), expected_len, "BTF blob size must match header");
+        assert_eq!(header.str_off, header.type_len, "str_off must equal type_len");
     }
 }
