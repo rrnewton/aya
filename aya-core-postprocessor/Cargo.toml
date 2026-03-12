@@ -1,0 +1,14 @@
+[package]
+name = "aya-core-postprocessor"
+version = "0.1.0"
+edition = "2024"
+description = "Post-processor that adds CO-RE relocation records to BPF ELF objects"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+object = { version = "0.38", features = ["elf", "read", "write"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
