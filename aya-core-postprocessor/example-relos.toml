@@ -1,0 +1,28 @@
+# Example sidecar file for the CO-RE post-processor.
+#
+# Each [[relocation]] entry describes one field access that should be
+# made relocatable via CO-RE.  The post-processor reads this file
+# alongside the compiled BPF ELF and generates bpf_core_relo records
+# in the .BTF.ext section.
+
+# Read task_struct.pid at instruction index 5 in section "tracepoint/sched/sched_switch"
+[[relocation]]
+section = "tracepoint/sched/sched_switch"
+insn_index = 5
+struct_name = "task_struct"
+field_path = "pid"
+
+# Read task_struct.tgid at instruction index 8
+[[relocation]]
+section = "tracepoint/sched/sched_switch"
+insn_index = 8
+struct_name = "task_struct"
+field_path = "tgid"
+
+# Read a nested field: task_struct.scx.dsq_vtime at instruction index 12
+# The field_path uses dots for nested access.
+[[relocation]]
+section = "tracepoint/sched/sched_switch"
+insn_index = 12
+struct_name = "task_struct"
+field_path = "scx.dsq_vtime"
