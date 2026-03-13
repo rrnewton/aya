@@ -456,6 +456,110 @@ impl BtfInfo {
         offset
     }
 
+    /// Given a struct type_id and a dot-separated field path like
+    /// "scx.dsq_vtime", returns the byte offset of the field within the
+    /// struct.
+    ///
+    /// This is used by the auto-discovery mode to match `offset_of!`
+    /// constants in the compiled BPF instructions.
+    ///
+    /// Note: BTF member offsets are stored in bits for structs that use
+    /// bitfields (kind_flag=1) and in bits for regular structs too.
+    /// For regular structs, the bit offset is always a multiple of 8.
+    pub fn compute_byte_offset(&self, struct_type_id: u32, field_path: &str) -> Result<u64> {
+        let mut total_bit_offset: u64 = 0;
+        let mut current_type_id = struct_type_id;
+
+        for field_name in field_path.split('.') {
+            let resolved_id = self.resolve_type(current_type_id)?;
+            let ty = self
+                .types
+                .get(resolved_id as usize)
+                .context("type_id out of range during byte offset computation")?;
+
+            let (common, members) = match ty {
+                BtfType::Struct(c, members) | BtfType::Union(c, members) => (c, members),
+                _ => bail!(
+                    "expected struct/union at type_id {resolved_id}, got {:?}",
+                    std::mem::discriminant(ty)
+                ),
+            };
+
+            let mut found = false;
+            let kind_flag = common.kind_flag();
+
+            for member in members {
+                if let Ok(member_name) = self.string_at(member.name_off) {
+                    if member_name == field_name {
+                        if kind_flag {
+                            // Bitfield encoding: offset = member.offset & 0xffffff
+                            total_bit_offset += (member.offset & 0x00ff_ffff) as u64;
+                        } else {
+                            total_bit_offset += member.offset as u64;
+                        }
+                        current_type_id = member.type_id;
+                        found = true;
+                        break;
+                    }
+                }
+
+                // Handle anonymous struct/union members.
+                if member.name_off == 0 {
+                    if let Ok(inner_id) = self.resolve_type(member.type_id) {
+                        if let Some(inner_ty) = self.types.get(inner_id as usize) {
+                            if let BtfType::Struct(_, inner_members)
+                            | BtfType::Union(_, inner_members) = inner_ty
+                            {
+                                for inner_member in inner_members {
+                                    if let Ok(inner_name) = self.string_at(inner_member.name_off) {
+                                        if inner_name == field_name {
+                                            let base = if kind_flag {
+                                                (member.offset & 0x00ff_ffff) as u64
+                                            } else {
+                                                member.offset as u64
+                                            };
+                                            let inner = if kind_flag {
+                                                (inner_member.offset & 0x00ff_ffff) as u64
+                                            } else {
+                                                inner_member.offset as u64
+                                            };
+                                            total_bit_offset += base + inner;
+                                            current_type_id = inner_member.type_id;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+            }
+
+            if !found {
+                bail!(
+                    "field '{}' not found in struct type_id {} (resolved {})",
+                    field_name,
+                    current_type_id,
+                    resolved_id
+                );
+            }
+        }
+
+        // Convert bit offset to byte offset.
+        if total_bit_offset % 8 != 0 {
+            bail!(
+                "field path results in non-byte-aligned offset: {} bits",
+                total_bit_offset
+            );
+        }
+
+        Ok(total_bit_offset / 8)
+    }
+
     /// Serializes the BTF data (header + types + strings) back to bytes.
     ///
     /// This re-encodes the original type data from the raw ELF and appends
