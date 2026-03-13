@@ -6,6 +6,14 @@ description = "Post-processor that adds CO-RE relocation records to BPF ELF obje
 
 [workspace]
 
+[[bin]]
+name = "aya-core-postprocessor"
+path = "src/main.rs"
+
+[lib]
+name = "aya_core_postprocessor"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

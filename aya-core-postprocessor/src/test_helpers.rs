@@ -232,6 +232,283 @@ fn build_test_elf() -> Vec<u8> {
     elf
 }
 
+/// Helper: build a BPF instruction (8 bytes).
+///
+/// BPF instruction layout:
+///   byte 0: opcode
+///   byte 1: dst_reg(lo nibble) | src_reg(hi nibble)
+///   bytes 2-3: offset (i16 LE)
+///   bytes 4-7: immediate (i32 LE)
+fn build_bpf_insn(opcode: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
+    let mut insn = [0u8; 8];
+    insn[0] = opcode;
+    insn[1] = (src << 4) | (dst & 0x0f);
+    insn[2..4].copy_from_slice(&off.to_le_bytes());
+    insn[4..8].copy_from_slice(&imm.to_le_bytes());
+    insn
+}
+
+/// Builds a test ELF like `build_test_elf` but with specific BPF
+/// instructions in the "tp/test" section that include an ALU64 ADD
+/// with immediate=12 at instruction index 2.
+///
+/// Instruction layout in tp/test:
+///   [0] mov r1, r6           (opcode=0xbf, nop-like)
+///   [1] mov r2, 4            (opcode=0xb7, load immediate)
+///   [2] add r1, 12           (opcode=0x07, ALU64 ADD IMM=12)
+///   [3] call bpf_probe_read  (opcode=0x85)
+///   [4..15] exit / padding   (opcode=0x95)
+fn build_test_elf_with_insns() -> Vec<u8> {
+    build_test_elf_inner(None)
+}
+
+/// Builds a test ELF with specific BPF instructions AND a
+/// `.aya.core_relo` section containing a marker for
+/// `outer_struct.nested.field_b`.
+fn build_test_elf_with_markers_and_insns() -> Vec<u8> {
+    // Build the marker data for outer_struct.nested.field_b
+    let mut marker_data = Vec::new();
+    marker_data.push(0xAC); // tag
+    let name = b"outer_struct";
+    marker_data.push(name.len() as u8);
+    marker_data.extend_from_slice(name);
+    let path = b"nested.field_b";
+    marker_data.push(path.len() as u8);
+    marker_data.extend_from_slice(path);
+
+    build_test_elf_inner(Some(&marker_data))
+}
+
+/// Inner ELF builder that supports optional marker data and custom
+/// BPF instructions.
+///
+/// Sections:
+///   [0] "" (SHT_NULL)
+///   [1] ".text" (SHT_PROGBITS)
+///   [2] ".BTF" (SHT_PROGBITS)
+///   [3] "tp/test" (SHT_PROGBITS) -- with specific instructions
+///   [4] ".aya.core_relo" (SHT_PROGBITS) -- optional, if marker_data given
+///   [N] ".shstrtab" (SHT_STRTAB)
+fn build_test_elf_inner(marker_data: Option<&[u8]>) -> Vec<u8> {
+    // -- Build BTF data (same as build_test_elf) --
+    let mut btf_strings = vec![0u8]; // offset 0 = empty string
+
+    let add_str = |strings: &mut Vec<u8>, s: &str| -> u32 {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(s.as_bytes());
+        strings.push(0);
+        off
+    };
+
+    let inner_struct_name_off = add_str(&mut btf_strings, "inner_struct");
+    let field_a_name_off = add_str(&mut btf_strings, "field_a");
+    let field_b_name_off = add_str(&mut btf_strings, "field_b");
+    let u32_name_off = add_str(&mut btf_strings, "u32");
+    let u64_name_off = add_str(&mut btf_strings, "u64");
+    let outer_struct_name_off = add_str(&mut btf_strings, "outer_struct");
+    let x_name_off = add_str(&mut btf_strings, "x");
+    let nested_name_off = add_str(&mut btf_strings, "nested");
+
+    let mut type_data = Vec::new();
+
+    let write_type_hdr = |buf: &mut Vec<u8>, name_off: u32, info: u32, size_or_type: u32| {
+        buf.extend_from_slice(&name_off.to_le_bytes());
+        buf.extend_from_slice(&info.to_le_bytes());
+        buf.extend_from_slice(&size_or_type.to_le_bytes());
+    };
+
+    // Type 1: struct inner_struct { u32 field_a; u64 field_b; }
+    let info = (4u32 << 24) | 2;
+    write_type_hdr(&mut type_data, inner_struct_name_off, info, 16);
+    type_data.extend_from_slice(&field_a_name_off.to_le_bytes());
+    type_data.extend_from_slice(&2u32.to_le_bytes());
+    type_data.extend_from_slice(&0u32.to_le_bytes());
+    type_data.extend_from_slice(&field_b_name_off.to_le_bytes());
+    type_data.extend_from_slice(&3u32.to_le_bytes());
+    type_data.extend_from_slice(&64u32.to_le_bytes());
+
+    // Type 2: INT u32 (4 bytes)
+    let info = (1u32 << 24) | 0;
+    write_type_hdr(&mut type_data, u32_name_off, info, 4);
+    type_data.extend_from_slice(&32u32.to_le_bytes());
+
+    // Type 3: INT u64 (8 bytes)
+    let info = (1u32 << 24) | 0;
+    write_type_hdr(&mut type_data, u64_name_off, info, 8);
+    type_data.extend_from_slice(&64u32.to_le_bytes());
+
+    // Type 4: struct outer_struct { u32 x; struct inner_struct nested; }
+    let info = (4u32 << 24) | 2;
+    write_type_hdr(&mut type_data, outer_struct_name_off, info, 20);
+    type_data.extend_from_slice(&x_name_off.to_le_bytes());
+    type_data.extend_from_slice(&2u32.to_le_bytes());
+    type_data.extend_from_slice(&0u32.to_le_bytes());
+    type_data.extend_from_slice(&nested_name_off.to_le_bytes());
+    type_data.extend_from_slice(&1u32.to_le_bytes());
+    type_data.extend_from_slice(&32u32.to_le_bytes());
+
+    let hdr_len = 24u32;
+    let type_off = 0u32;
+    let type_len = type_data.len() as u32;
+    let str_off = type_len;
+    let str_len = btf_strings.len() as u32;
+
+    let mut btf_section_data = Vec::new();
+    btf_section_data.extend_from_slice(&0xEB9Fu16.to_le_bytes());
+    btf_section_data.push(1);
+    btf_section_data.push(0);
+    btf_section_data.extend_from_slice(&hdr_len.to_le_bytes());
+    btf_section_data.extend_from_slice(&type_off.to_le_bytes());
+    btf_section_data.extend_from_slice(&type_len.to_le_bytes());
+    btf_section_data.extend_from_slice(&str_off.to_le_bytes());
+    btf_section_data.extend_from_slice(&str_len.to_le_bytes());
+    btf_section_data.extend_from_slice(&type_data);
+    btf_section_data.extend_from_slice(&btf_strings);
+
+    // -- Build section name string table --
+    let mut shstrtab = vec![0u8]; // offset 0 = ""
+    let text_name_off = shstrtab.len();
+    shstrtab.extend_from_slice(b".text\0");
+    let btf_name_off = shstrtab.len();
+    shstrtab.extend_from_slice(b".BTF\0");
+    let tp_name_off = shstrtab.len();
+    shstrtab.extend_from_slice(b"tp/test\0");
+
+    let marker_name_off = if marker_data.is_some() {
+        let off = shstrtab.len();
+        shstrtab.extend_from_slice(b".aya.core_relo\0");
+        off
+    } else {
+        0
+    };
+
+    let shstrtab_name_off = shstrtab.len();
+    shstrtab.extend_from_slice(b".shstrtab\0");
+
+    // -- Build BPF instructions for tp/test --
+    let mut tp_insns = Vec::new();
+    // [0] mov r1, r6 (BPF_ALU64 | BPF_MOV | BPF_SRC_REG = 0xbf)
+    tp_insns.extend_from_slice(&build_bpf_insn(0xbf, 1, 6, 0, 0));
+    // [1] mov r2, 4 (BPF_ALU64 | BPF_MOV | BPF_SRC_IMM = 0xb7)
+    tp_insns.extend_from_slice(&build_bpf_insn(0xb7, 2, 0, 0, 4));
+    // [2] add r1, 12 (BPF_ALU64 | BPF_ADD | BPF_SRC_IMM = 0x07)
+    tp_insns.extend_from_slice(&build_bpf_insn(0x07, 1, 0, 0, 12));
+    // [3] call bpf_probe_read_kernel (BPF_JMP | BPF_CALL = 0x85, imm=113)
+    tp_insns.extend_from_slice(&build_bpf_insn(0x85, 0, 0, 0, 113));
+    // [4..15] exit instructions
+    for _ in 4..16 {
+        tp_insns.extend_from_slice(&build_bpf_insn(0x95, 0, 0, 0, 0));
+    }
+
+    let text_data = vec![0u8; 128]; // .text: 16 nop instructions
+
+    // -- Compute layout --
+    let has_marker = marker_data.is_some();
+    let num_sections = if has_marker { 6u16 } else { 5u16 };
+    let shstrtab_idx = num_sections - 1;
+
+    let text_offset = 64usize;
+    let btf_offset = text_offset + text_data.len();
+    let tp_offset = (btf_offset + btf_section_data.len() + 3) & !3; // align to 4
+
+    let marker_offset;
+    let next_after_tp;
+    if let Some(mdata) = marker_data {
+        marker_offset = (tp_offset + tp_insns.len() + 3) & !3;
+        next_after_tp = marker_offset + mdata.len();
+    } else {
+        marker_offset = 0;
+        next_after_tp = tp_offset + tp_insns.len();
+    }
+
+    let shstrtab_offset = next_after_tp;
+    let shdr_offset = (shstrtab_offset + shstrtab.len() + 7) & !7; // align to 8
+
+    let total_size = shdr_offset + num_sections as usize * 64;
+    let mut elf = vec![0u8; total_size];
+
+    // ELF header
+    elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    write_u16_le(&mut elf, 16, 1); // ET_REL
+    write_u16_le(&mut elf, 18, 247); // EM_BPF
+    write_u32_le(&mut elf, 20, 1); // e_version
+    write_u64_le(&mut elf, 40, shdr_offset as u64);
+    write_u16_le(&mut elf, 52, 64); // e_ehsize
+    write_u16_le(&mut elf, 58, 64); // e_shentsize
+    write_u16_le(&mut elf, 60, num_sections);
+    write_u16_le(&mut elf, 62, shstrtab_idx);
+
+    // Copy section data
+    elf[text_offset..text_offset + text_data.len()].copy_from_slice(&text_data);
+    elf[btf_offset..btf_offset + btf_section_data.len()].copy_from_slice(&btf_section_data);
+    elf[tp_offset..tp_offset + tp_insns.len()].copy_from_slice(&tp_insns);
+
+    if let Some(mdata) = marker_data {
+        elf[marker_offset..marker_offset + mdata.len()].copy_from_slice(mdata);
+    }
+
+    elf[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(&shstrtab);
+
+    // Section headers
+    let mut sh_idx = 0;
+
+    // [0] SHT_NULL - already zeroed
+    sh_idx += 1;
+
+    // [1] .text
+    let sh = shdr_offset + sh_idx * 64;
+    write_u32_le(&mut elf, sh, text_name_off as u32);
+    write_u32_le(&mut elf, sh + 4, 1); // SHT_PROGBITS
+    write_u64_le(&mut elf, sh + 8, 0x6); // SHF_ALLOC|SHF_EXECINSTR
+    write_u64_le(&mut elf, sh + 24, text_offset as u64);
+    write_u64_le(&mut elf, sh + 32, text_data.len() as u64);
+    write_u64_le(&mut elf, sh + 48, 8);
+    sh_idx += 1;
+
+    // [2] .BTF
+    let sh = shdr_offset + sh_idx * 64;
+    write_u32_le(&mut elf, sh, btf_name_off as u32);
+    write_u32_le(&mut elf, sh + 4, 1); // SHT_PROGBITS
+    write_u64_le(&mut elf, sh + 24, btf_offset as u64);
+    write_u64_le(&mut elf, sh + 32, btf_section_data.len() as u64);
+    write_u64_le(&mut elf, sh + 48, 4);
+    sh_idx += 1;
+
+    // [3] tp/test
+    let sh = shdr_offset + sh_idx * 64;
+    write_u32_le(&mut elf, sh, tp_name_off as u32);
+    write_u32_le(&mut elf, sh + 4, 1); // SHT_PROGBITS
+    write_u64_le(&mut elf, sh + 8, 0x6); // SHF_ALLOC|SHF_EXECINSTR
+    write_u64_le(&mut elf, sh + 24, tp_offset as u64);
+    write_u64_le(&mut elf, sh + 32, tp_insns.len() as u64);
+    write_u64_le(&mut elf, sh + 48, 8);
+    sh_idx += 1;
+
+    // [4] .aya.core_relo (optional)
+    if let Some(mdata) = marker_data {
+        let sh = shdr_offset + sh_idx * 64;
+        write_u32_le(&mut elf, sh, marker_name_off as u32);
+        write_u32_le(&mut elf, sh + 4, 1); // SHT_PROGBITS
+        write_u64_le(&mut elf, sh + 24, marker_offset as u64);
+        write_u64_le(&mut elf, sh + 32, mdata.len() as u64);
+        write_u64_le(&mut elf, sh + 48, 1);
+        sh_idx += 1;
+    }
+
+    // [N] .shstrtab
+    let sh = shdr_offset + sh_idx * 64;
+    write_u32_le(&mut elf, sh, shstrtab_name_off as u32);
+    write_u32_le(&mut elf, sh + 4, 3); // SHT_STRTAB
+    write_u64_le(&mut elf, sh + 24, shstrtab_offset as u64);
+    write_u64_le(&mut elf, sh + 32, shstrtab.len() as u64);
+    write_u64_le(&mut elf, sh + 48, 1);
+
+    elf
+}
+
 fn write_u16_le(data: &mut [u8], offset: usize, val: u16) {
     data[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
 }
@@ -492,5 +769,176 @@ mod tests {
             }
         }
         panic!(".BTF.ext not found in output");
+    }
+
+    // ---- Tests for new auto-discovery functionality ----
+
+    #[test]
+    fn test_compute_byte_offset_simple() {
+        let elf = build_test_elf();
+        let btf = BtfInfo::parse_from_elf(&elf).unwrap();
+
+        // inner_struct.field_a at bit offset 0 -> byte offset 0
+        let off = btf.compute_byte_offset(1, "field_a").unwrap();
+        assert_eq!(off, 0);
+
+        // inner_struct.field_b at bit offset 64 -> byte offset 8
+        let off = btf.compute_byte_offset(1, "field_b").unwrap();
+        assert_eq!(off, 8);
+    }
+
+    #[test]
+    fn test_compute_byte_offset_nested() {
+        let elf = build_test_elf();
+        let btf = BtfInfo::parse_from_elf(&elf).unwrap();
+
+        // outer_struct.x at bit offset 0 -> byte offset 0
+        let off = btf.compute_byte_offset(4, "x").unwrap();
+        assert_eq!(off, 0);
+
+        // outer_struct.nested at bit offset 32 -> byte offset 4
+        let off = btf.compute_byte_offset(4, "nested").unwrap();
+        assert_eq!(off, 4);
+
+        // outer_struct.nested.field_a: nested at 32 bits + field_a at 0 bits
+        //   = 32 bits = 4 bytes
+        let off = btf.compute_byte_offset(4, "nested.field_a").unwrap();
+        assert_eq!(off, 4);
+
+        // outer_struct.nested.field_b: nested at 32 bits + field_b at 64 bits
+        //   = 96 bits = 12 bytes
+        let off = btf.compute_byte_offset(4, "nested.field_b").unwrap();
+        assert_eq!(off, 12);
+    }
+
+    #[test]
+    fn test_insn_scanner_finds_add_immediate() {
+        let elf = build_test_elf_with_insns();
+        let matches = crate::insn_scanner::find_insns_with_offset(&elf, 12).unwrap();
+
+        // The test ELF has an ALU64 ADD IMM with immediate=12 at
+        // instruction index 2 in the "tp/test" section.
+        assert!(!matches.is_empty(), "should find at least one match");
+        let m = &matches[0];
+        assert_eq!(m.section_name, "tp/test");
+        assert_eq!(m.insn_index, 2);
+    }
+
+    #[test]
+    fn test_insn_scanner_no_match() {
+        let elf = build_test_elf_with_insns();
+        let matches = crate::insn_scanner::find_insns_with_offset(&elf, 999).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_marker_roundtrip() {
+        // Build marker bytes and verify they parse correctly.
+        let mut data = Vec::new();
+        // Marker tag
+        data.push(0xAC);
+        // Struct name: "outer_struct"
+        let name = b"outer_struct";
+        data.push(name.len() as u8);
+        data.extend_from_slice(name);
+        // Field path: "nested.field_b"
+        let path = b"nested.field_b";
+        data.push(path.len() as u8);
+        data.extend_from_slice(path);
+
+        let markers = crate::marker_parser::parse_markers(&data).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].struct_name, "outer_struct");
+        assert_eq!(markers[0].field_path, "nested.field_b");
+    }
+
+    #[test]
+    fn test_auto_discovery_pipeline() {
+        // Build an ELF with:
+        //   - BTF containing inner_struct and outer_struct
+        //   - A "tp/test" section with ALU64 ADD IMM=12 at insn index 2
+        //   - A .aya.core_relo section with a marker for outer_struct.nested.field_b
+        //
+        // outer_struct.nested.field_b has byte offset 12 (nested at offset 4,
+        // field_b within inner_struct at offset 8, total = 4+8 = 12).
+        //
+        // The auto-discovery pipeline should:
+        //   1. Read the marker
+        //   2. Compute byte offset = 12
+        //   3. Find the ALU64 ADD IMM=12 instruction at insn index 2
+        //   4. Generate a CO-RE relocation for it
+
+        let elf = build_test_elf_with_markers_and_insns();
+
+        let result = crate::process_elf_auto(&elf).unwrap();
+
+        // Verify the result has a .BTF.ext section with a CO-RE relocation.
+        assert_eq!(&result[0..4], &[0x7f, b'E', b'L', b'F']);
+
+        let e_shoff = read_u64_le(&result, 40) as usize;
+        let e_shnum = read_u16_le(&result, 60) as usize;
+        let e_shstrndx = read_u16_le(&result, 62) as usize;
+
+        let shstrtab_shdr = e_shoff + e_shstrndx * 64;
+        let shstrtab_off = read_u64_le(&result, shstrtab_shdr + 24) as usize;
+        let shstrtab_size = read_u64_le(&result, shstrtab_shdr + 32) as usize;
+        let shstrtab_data = &result[shstrtab_off..shstrtab_off + shstrtab_size];
+
+        let section_name = |idx: usize| -> &str {
+            let shdr = e_shoff + idx * 64;
+            let name_off = read_u32_le(&result, shdr) as usize;
+            let end = shstrtab_data[name_off..].iter().position(|&b| b == 0)
+                .map(|p| name_off + p).unwrap_or(shstrtab_data.len());
+            std::str::from_utf8(&shstrtab_data[name_off..end]).unwrap_or("")
+        };
+
+        let mut found_btf_ext = false;
+        for i in 0..e_shnum {
+            if section_name(i) == ".BTF.ext" {
+                found_btf_ext = true;
+
+                let shdr = e_shoff + i * 64;
+                let ext_off = read_u64_le(&result, shdr + 24) as usize;
+                let ext_size = read_u64_le(&result, shdr + 32) as usize;
+                let ext_data = &result[ext_off..ext_off + ext_size];
+
+                let hdr_len = read_u32_le(ext_data, 4) as usize;
+                let core_relo_off = read_u32_le(ext_data, 24) as usize;
+                let core_relo_len = read_u32_le(ext_data, 28) as usize;
+                assert!(core_relo_len > 0, "should have core_relo records");
+
+                let relo_data = &ext_data[hdr_len + core_relo_off..hdr_len + core_relo_off + core_relo_len];
+
+                // Check rec_size
+                let rec_size = read_u32_le(relo_data, 0);
+                assert_eq!(rec_size, 16);
+
+                // Check num_info
+                let num_info = read_u32_le(relo_data, 8);
+                assert_eq!(num_info, 1, "expected 1 relocation");
+
+                // Check insn_off = 2 * 8 = 16
+                let insn_off = read_u32_le(relo_data, 12);
+                assert_eq!(insn_off, 16, "insn_off should be 16 (insn index 2)");
+
+                // Check type_id = 4 (outer_struct)
+                let type_id = read_u32_le(relo_data, 16);
+                assert_eq!(type_id, 4);
+
+                // Check kind = 0 (BPF_CORE_FIELD_BYTE_OFFSET)
+                let kind = read_u32_le(relo_data, 24);
+                assert_eq!(kind, 0);
+
+                // Verify access string
+                let btf = BtfInfo::parse_from_elf(&result).unwrap();
+                let access_str_off = read_u32_le(relo_data, 20);
+                let access_str = btf.string_at(access_str_off).unwrap();
+                assert_eq!(access_str, "0:1:1"); // nested=1, field_b=1
+
+                break;
+            }
+        }
+
+        assert!(found_btf_ext, ".BTF.ext section should exist in output");
     }
 }
