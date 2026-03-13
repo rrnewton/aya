@@ -1,26 +1,20 @@
-//! CO-RE post-processor for BPF ELF objects.
+//! CO-RE post-processor CLI for BPF ELF objects.
 //!
-//! Takes a compiled BPF ELF file and a sidecar TOML file describing
-//! field accesses, and adds `bpf_core_relo` records to the `.BTF.ext`
-//! section so that aya's `relocate_btf()` can patch field offsets at
-//! load time for different kernels.
-
-mod btf_ext_writer;
-mod btf_parser;
-mod elf_patcher;
-mod sidecar;
-
-#[cfg(test)]
-mod test_helpers;
+//! Supports two input modes:
+//!
+//! 1. **Sidecar TOML** (`--sidecar`): A hand-written file specifying
+//!    exact section names, instruction indices, struct names, and field
+//!    paths.
+//!
+//! 2. **Auto-discovery** (`--auto`): Reads `.aya.core_relo` markers
+//!    emitted by the `core_read!` proc macro.
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use btf_ext_writer::BtfExtWriter;
-use btf_parser::BtfInfo;
-use sidecar::SidecarConfig;
+use aya_core_postprocessor::sidecar::SidecarConfig;
 
 #[derive(Parser)]
 #[command(name = "aya-core-postprocessor")]
@@ -30,9 +24,15 @@ struct Cli {
     #[arg(short, long)]
     elf: PathBuf,
 
-    /// Path to the sidecar TOML file describing relocations
+    /// Path to the sidecar TOML file describing relocations.
+    /// Mutually exclusive with --auto.
     #[arg(short, long)]
-    sidecar: PathBuf,
+    sidecar: Option<PathBuf>,
+
+    /// Auto-discover relocations from .aya.core_relo markers.
+    /// Mutually exclusive with --sidecar.
+    #[arg(short, long)]
+    auto: bool,
 
     /// Output path (defaults to overwriting the input)
     #[arg(short, long)]
@@ -42,49 +42,54 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.sidecar.is_some() && cli.auto {
+        bail!("--sidecar and --auto are mutually exclusive");
+    }
+    if cli.sidecar.is_none() && !cli.auto {
+        bail!("specify either --sidecar <FILE> or --auto");
+    }
+
     let elf_data =
         std::fs::read(&cli.elf).with_context(|| format!("reading ELF: {:?}", cli.elf))?;
 
-    let sidecar_text = std::fs::read_to_string(&cli.sidecar)
-        .with_context(|| format!("reading sidecar: {:?}", cli.sidecar))?;
-    let config: SidecarConfig =
-        toml::from_str(&sidecar_text).context("parsing sidecar TOML")?;
-
-    if config.relocation.is_empty() {
-        eprintln!("No relocations specified in sidecar file, nothing to do.");
-        return Ok(());
-    }
-
     let output_path = cli.output.as_ref().unwrap_or(&cli.elf);
-    let result = process_elf(&elf_data, &config)?;
-    std::fs::write(output_path, &result)
-        .with_context(|| format!("writing output: {:?}", output_path))?;
 
-    eprintln!(
-        "Wrote {} CO-RE relocations to {:?}",
-        config.relocation.len(),
-        output_path
-    );
-    Ok(())
-}
+    if let Some(sidecar_path) = &cli.sidecar {
+        let sidecar_text = std::fs::read_to_string(sidecar_path)
+            .with_context(|| format!("reading sidecar: {:?}", sidecar_path))?;
+        let config: SidecarConfig =
+            toml::from_str(&sidecar_text).context("parsing sidecar TOML")?;
 
-/// Main processing pipeline.
-fn process_elf(elf_data: &[u8], config: &SidecarConfig) -> Result<Vec<u8>> {
-    // Step 1: Parse the existing BTF from the .BTF section.
-    let btf = BtfInfo::parse_from_elf(elf_data).context("parsing BTF from ELF")?;
+        if config.relocation.is_empty() {
+            eprintln!("No relocations specified in sidecar file, nothing to do.");
+            return Ok(());
+        }
 
-    // Step 2: Build CO-RE relocation records.
-    let mut writer = BtfExtWriter::new(&btf);
+        let result = aya_core_postprocessor::process_elf(&elf_data, &config)?;
+        std::fs::write(output_path, &result)
+            .with_context(|| format!("writing output: {:?}", output_path))?;
 
-    for (i, relo) in config.relocation.iter().enumerate() {
-        writer
-            .add_relocation(relo)
-            .with_context(|| format!("processing relocation #{i}: {relo:?}"))?;
+        eprintln!(
+            "Wrote {} CO-RE relocations to {:?}",
+            config.relocation.len(),
+            output_path
+        );
+    } else {
+        // Auto-discovery mode.
+        let markers = aya_core_postprocessor::marker_parser::parse_markers_from_elf(&elf_data)
+            .context("checking for .aya.core_relo markers")?;
+
+        if markers.is_empty() {
+            eprintln!("No .aya.core_relo markers found, nothing to do.");
+            return Ok(());
+        }
+
+        eprintln!("Found {} markers, processing...", markers.len());
+        let result = aya_core_postprocessor::process_elf_auto(&elf_data)?;
+        std::fs::write(output_path, &result)
+            .with_context(|| format!("writing output: {:?}", output_path))?;
+        eprintln!("CO-RE relocations written to {:?}", output_path);
     }
 
-    // Step 3: Generate the new .BTF and .BTF.ext section contents.
-    let (new_btf_data, new_btf_ext_data) = writer.finish(elf_data)?;
-
-    // Step 4: Patch the ELF with the new section contents.
-    elf_patcher::patch_elf_sections(elf_data, &new_btf_data, &new_btf_ext_data)
+    Ok(())
 }
