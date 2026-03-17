@@ -20,7 +20,7 @@ use crate::{
     btf::{
         Array, BtfEnum, BtfEnum64, BtfKind, BtfMember, BtfType, Const, DataSec, DataSecEntry, Enum,
         Enum64, Enum64Fallback, Enum64VariantFallback, FuncInfo, FuncLinkage, Int, IntEncoding,
-        LineInfo, Struct, Typedef, Union, Var, VarLinkage,
+        LineInfo, Ptr, Struct, TypeTag, Typedef, Union, Var, VarLinkage,
         info::{FuncSecInfo, LineSecInfo},
         relocation::Relocation,
     },
@@ -495,6 +495,95 @@ impl Btf {
         }
     }
 
+    /// Rewrites `Kptr<T>` wrapper structs into kernel-expected kptr BTF.
+    ///
+    /// Rust BPF programs declare kptr globals as:
+    /// ```ignore
+    /// #[repr(C)]
+    /// pub struct Kptr<T> { ptr: *mut T }
+    /// static mut MY_KPTR: Kptr<bpf_cpumask> = Kptr::zeroed();
+    /// ```
+    ///
+    /// The compiler emits BTF like:
+    /// ```text
+    /// VAR "MY_KPTR" -> STRUCT "Kptr" { ptr: PTR -> STRUCT "bpf_cpumask" }
+    /// ```
+    ///
+    /// But the BPF verifier expects:
+    /// ```text
+    /// VAR "MY_KPTR" -> PTR -> TYPE_TAG("kptr") -> STRUCT "bpf_cpumask"
+    /// ```
+    ///
+    /// This method scans for Kptr wrapper structs and rewrites VARs that
+    /// reference them to use the kernel-expected `PTR -> TYPE_TAG -> T` chain.
+    pub fn fixup_kptr_types(&mut self) {
+        // Phase 1: Identify all Kptr-like structs.
+        // A Kptr struct has:
+        //   - Name "Kptr" (the generic Kptr<T> gets monomorphized but the
+        //     BTF struct name stays "Kptr")
+        //   - Exactly one member
+        //   - That member is a PTR type
+        //
+        // For each such struct, record (struct_type_id -> ptr_target_type_id).
+        let mut kptr_structs: Vec<(u32, u32)> = Vec::new();
+
+        for (type_id, ty) in self.types.types.iter().enumerate() {
+            if let BtfType::Struct(s) = ty {
+                let name = self.string_at(s.name_offset).unwrap_or_default();
+                if name == "Kptr" && s.members.len() == 1 {
+                    let member_type_id = s.members[0].btf_type;
+                    // Check that the member is a PTR
+                    if let Ok(BtfType::Ptr(ptr)) = self.types.type_by_id(member_type_id) {
+                        let target_type_id = ptr.btf_type;
+                        kptr_structs.push((type_id as u32, target_type_id));
+                    }
+                }
+            }
+        }
+
+        if kptr_structs.is_empty() {
+            return;
+        }
+
+        // Build a lookup from kptr struct type_id -> ptr target type_id
+        let kptr_map: Vec<(u32, u32)> = kptr_structs;
+
+        // Phase 2: For each Kptr struct, create the replacement type chain:
+        //   TYPE_TAG("kptr") -> T
+        //   PTR -> TYPE_TAG
+        // We create one pair per unique Kptr struct instance.
+        let mut replacements: Vec<(u32, u32)> = Vec::new(); // (kptr_struct_id, new_ptr_id)
+
+        for &(kptr_struct_id, target_type_id) in &kptr_map {
+            // Add TYPE_TAG("kptr") pointing to T
+            let kptr_tag_name = self.add_string("kptr");
+            let type_tag_id =
+                self.add_type(BtfType::TypeTag(TypeTag::new(kptr_tag_name, target_type_id)));
+
+            // Add PTR -> TYPE_TAG
+            let new_ptr_id = self.add_type(BtfType::Ptr(Ptr::new(0, type_tag_id)));
+
+            replacements.push((kptr_struct_id, new_ptr_id));
+        }
+
+        // Phase 3: Rewrite all VARs that reference a Kptr struct to point
+        // to the new PTR instead.
+        for t in &mut self.types.types {
+            if let BtfType::Var(var) = t {
+                for &(kptr_struct_id, new_ptr_id) in &replacements {
+                    if var.btf_type == kptr_struct_id {
+                        debug!(
+                            "fixup_kptr_types: rewriting VAR type from Kptr struct {} to PTR -> TYPE_TAG chain {}",
+                            kptr_struct_id, new_ptr_id
+                        );
+                        var.btf_type = new_ptr_id;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Encodes the metadata as BTF format.
     ///
     /// Sanitizes types that the kernel rejects during `BPF_BTF_LOAD`:
@@ -895,6 +984,10 @@ impl Object {
                 obj_btf.fixup_func_linkage();
             }
 
+            // Rewrite Kptr<T> wrapper structs into PTR -> TYPE_TAG("kptr") -> T
+            // chains that the BPF verifier expects for kptr globals.
+            obj_btf.fixup_kptr_types();
+
             // fixup btf
             obj_btf.fixup_and_sanitize(
                 &self.section_infos,
@@ -1248,7 +1341,7 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
-    use crate::btf::{BtfParam, DeclTag, Float, Func, FuncProto, Ptr, TypeTag};
+    use crate::btf::{BtfParam, DeclTag, Float, Func, FuncProto};
 
     #[test]
     fn test_parse_header() {
@@ -2200,5 +2293,230 @@ mod tests {
         let expected_len = header.hdr_len as usize + header.type_len as usize + header.str_len as usize;
         assert_eq!(raw.len(), expected_len, "BTF blob size must match header");
         assert_eq!(header.str_off, header.type_len, "str_off must equal type_len");
+    }
+
+    #[test]
+    fn test_fixup_kptr_types() {
+        // Build BTF that mirrors what rustc emits for:
+        //   static mut PRIMARY_CPUMASK: Kptr<bpf_cpumask> = Kptr::zeroed();
+        //
+        // Type chain before fixup:
+        //   VAR "PRIMARY_CPUMASK" -> STRUCT "Kptr" { ptr: PTR -> STRUCT "bpf_cpumask" }
+        //
+        // Expected after fixup:
+        //   VAR "PRIMARY_CPUMASK" -> PTR -> TYPE_TAG("kptr") -> STRUCT "bpf_cpumask"
+        let mut btf = Btf::new();
+
+        // 1. STRUCT "bpf_cpumask" (the target kernel type)
+        let cpumask_name = btf.add_string("bpf_cpumask");
+        let cpumask_id = btf.add_type(BtfType::Struct(Struct::new(cpumask_name, vec![], 8)));
+
+        // 2. PTR -> bpf_cpumask (the inner pointer in the Kptr wrapper)
+        let inner_ptr_id = btf.add_type(BtfType::Ptr(Ptr::new(0, cpumask_id)));
+
+        // 3. STRUCT "Kptr" { ptr: PTR -> bpf_cpumask }
+        let kptr_name = btf.add_string("Kptr");
+        let member_name = btf.add_string("ptr");
+        let kptr_struct_id = btf.add_type(BtfType::Struct(Struct::new(
+            kptr_name,
+            vec![BtfMember {
+                name_offset: member_name,
+                btf_type: inner_ptr_id,
+                offset: 0,
+            }],
+            8,
+        )));
+
+        // 4. VAR "PRIMARY_CPUMASK" -> STRUCT "Kptr"
+        let var_name = btf.add_string("PRIMARY_CPUMASK");
+        let var_id = btf.add_type(BtfType::Var(Var::new(
+            var_name,
+            kptr_struct_id,
+            VarLinkage::Global,
+        )));
+
+        // Verify pre-fixup state: VAR points to Kptr struct
+        assert_matches!(btf.type_by_id(var_id).unwrap(), BtfType::Var(v) => {
+            assert_eq!(v.btf_type, kptr_struct_id);
+        });
+
+        // Run the fixup
+        btf.fixup_kptr_types();
+
+        // Verify post-fixup: VAR should now point to a new PTR
+        let var_ty = btf.type_by_id(var_id).unwrap();
+        let new_ptr_id = match var_ty {
+            BtfType::Var(v) => {
+                // VAR should no longer point to the Kptr struct
+                assert_ne!(v.btf_type, kptr_struct_id, "VAR should no longer point to Kptr struct");
+                v.btf_type
+            }
+            other => panic!("expected Var, got {:?}", other),
+        };
+
+        // The new PTR should point to a TYPE_TAG
+        let ptr_ty = btf.type_by_id(new_ptr_id).unwrap();
+        let type_tag_id = match ptr_ty {
+            BtfType::Ptr(p) => p.btf_type,
+            other => panic!("expected Ptr, got {:?}", other),
+        };
+
+        // The TYPE_TAG should be named "kptr" and point to bpf_cpumask
+        let type_tag_ty = btf.type_by_id(type_tag_id).unwrap();
+        match type_tag_ty {
+            BtfType::TypeTag(tt) => {
+                let tag_name = btf.string_at(tt.name_offset).unwrap();
+                assert_eq!(tag_name, "kptr", "TYPE_TAG should be named 'kptr'");
+                assert_eq!(tt.btf_type, cpumask_id, "TYPE_TAG should point to bpf_cpumask");
+            }
+            other => panic!("expected TypeTag, got {:?}", other),
+        }
+
+        // Verify the full chain: VAR -> PTR -> TYPE_TAG("kptr") -> STRUCT "bpf_cpumask"
+        // and that it round-trips through serialization
+        let raw = btf.to_bytes();
+        let parsed = Btf::parse(&raw, Endianness::default()).unwrap();
+        assert_matches!(parsed.type_by_id(var_id).unwrap(), BtfType::Var(v) => {
+            assert_eq!(v.btf_type, new_ptr_id);
+        });
+    }
+
+    #[test]
+    fn test_fixup_kptr_types_no_kptr_is_noop() {
+        // Verify that fixup_kptr_types is a no-op when there are no Kptr structs
+        let mut btf = Btf::new();
+        let int_name = btf.add_string("int");
+        let int_id = btf.add_type(BtfType::Int(Int::new(int_name, 4, IntEncoding::Signed, 0)));
+        let var_name = btf.add_string("my_var");
+        let var_id = btf.add_type(BtfType::Var(Var::new(var_name, int_id, VarLinkage::Global)));
+
+        btf.fixup_kptr_types();
+
+        // VAR should still point to int, unchanged
+        assert_matches!(btf.type_by_id(var_id).unwrap(), BtfType::Var(v) => {
+            assert_eq!(v.btf_type, int_id);
+        });
+    }
+
+    #[test]
+    fn test_fixup_kptr_types_non_kptr_struct_untouched() {
+        // A struct named something other than "Kptr" should not be rewritten
+        let mut btf = Btf::new();
+
+        let inner_name = btf.add_string("some_type");
+        let inner_id = btf.add_type(BtfType::Struct(Struct::new(inner_name, vec![], 4)));
+        let ptr_id = btf.add_type(BtfType::Ptr(Ptr::new(0, inner_id)));
+
+        let struct_name = btf.add_string("NotKptr");
+        let member_name = btf.add_string("ptr");
+        let struct_id = btf.add_type(BtfType::Struct(Struct::new(
+            struct_name,
+            vec![BtfMember {
+                name_offset: member_name,
+                btf_type: ptr_id,
+                offset: 0,
+            }],
+            8,
+        )));
+
+        let var_name = btf.add_string("my_var");
+        let var_id = btf.add_type(BtfType::Var(Var::new(var_name, struct_id, VarLinkage::Global)));
+
+        btf.fixup_kptr_types();
+
+        // VAR should still point to the original struct
+        assert_matches!(btf.type_by_id(var_id).unwrap(), BtfType::Var(v) => {
+            assert_eq!(v.btf_type, struct_id);
+        });
+    }
+
+    #[test]
+    fn test_fixup_kptr_types_multiple_kptrs() {
+        // Test with two different Kptr variables pointing to different target types
+        let mut btf = Btf::new();
+
+        // Target type 1: bpf_cpumask
+        let cpumask_name = btf.add_string("bpf_cpumask");
+        let cpumask_id = btf.add_type(BtfType::Struct(Struct::new(cpumask_name, vec![], 8)));
+
+        // Target type 2: bpf_task
+        let task_name = btf.add_string("bpf_task");
+        let task_id = btf.add_type(BtfType::Struct(Struct::new(task_name, vec![], 16)));
+
+        // Kptr struct 1: Kptr<bpf_cpumask>
+        let ptr1_id = btf.add_type(BtfType::Ptr(Ptr::new(0, cpumask_id)));
+        let kptr_name1 = btf.add_string("Kptr");
+        let member_name1 = btf.add_string("ptr");
+        let kptr1_id = btf.add_type(BtfType::Struct(Struct::new(
+            kptr_name1,
+            vec![BtfMember {
+                name_offset: member_name1,
+                btf_type: ptr1_id,
+                offset: 0,
+            }],
+            8,
+        )));
+
+        // Kptr struct 2: Kptr<bpf_task> (separate monomorphization, same name)
+        let ptr2_id = btf.add_type(BtfType::Ptr(Ptr::new(0, task_id)));
+        let kptr_name2 = btf.add_string("Kptr");
+        let member_name2 = btf.add_string("ptr");
+        let kptr2_id = btf.add_type(BtfType::Struct(Struct::new(
+            kptr_name2,
+            vec![BtfMember {
+                name_offset: member_name2,
+                btf_type: ptr2_id,
+                offset: 0,
+            }],
+            8,
+        )));
+
+        // Two VARs
+        let var1_name = btf.add_string("CPUMASK_KPTR");
+        let var1_id = btf.add_type(BtfType::Var(Var::new(var1_name, kptr1_id, VarLinkage::Global)));
+
+        let var2_name = btf.add_string("TASK_KPTR");
+        let var2_id = btf.add_type(BtfType::Var(Var::new(var2_name, kptr2_id, VarLinkage::Global)));
+
+        btf.fixup_kptr_types();
+
+        // Both VARs should have been rewritten
+        // VAR1 -> PTR -> TYPE_TAG("kptr") -> bpf_cpumask
+        let var1 = match btf.type_by_id(var1_id).unwrap() {
+            BtfType::Var(v) => v,
+            other => panic!("expected Var, got {:?}", other),
+        };
+        assert_ne!(var1.btf_type, kptr1_id);
+        let ptr1 = match btf.type_by_id(var1.btf_type).unwrap() {
+            BtfType::Ptr(p) => p,
+            other => panic!("expected Ptr, got {:?}", other),
+        };
+        let tt1 = match btf.type_by_id(ptr1.btf_type).unwrap() {
+            BtfType::TypeTag(tt) => tt,
+            other => panic!("expected TypeTag, got {:?}", other),
+        };
+        assert_eq!(btf.string_at(tt1.name_offset).unwrap(), "kptr");
+        assert_eq!(tt1.btf_type, cpumask_id);
+
+        // VAR2 -> PTR -> TYPE_TAG("kptr") -> bpf_task
+        let var2 = match btf.type_by_id(var2_id).unwrap() {
+            BtfType::Var(v) => v,
+            other => panic!("expected Var, got {:?}", other),
+        };
+        assert_ne!(var2.btf_type, kptr2_id);
+        let ptr2 = match btf.type_by_id(var2.btf_type).unwrap() {
+            BtfType::Ptr(p) => p,
+            other => panic!("expected Ptr, got {:?}", other),
+        };
+        let tt2 = match btf.type_by_id(ptr2.btf_type).unwrap() {
+            BtfType::TypeTag(tt) => tt,
+            other => panic!("expected TypeTag, got {:?}", other),
+        };
+        assert_eq!(btf.string_at(tt2.name_offset).unwrap(), "kptr");
+        assert_eq!(tt2.btf_type, task_id);
+
+        // Verify serialization round-trip
+        let raw = btf.to_bytes();
+        Btf::parse(&raw, Endianness::default()).unwrap();
     }
 }
