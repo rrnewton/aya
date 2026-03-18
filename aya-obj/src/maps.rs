@@ -318,6 +318,11 @@ pub struct LegacyMap {
     pub symbol_index: Option<usize>,
     /// The map data
     pub data: Vec<u8>,
+    /// BTF value type id for data section maps (.bss, .data, .rodata).
+    ///
+    /// Set to the DATASEC type ID from the program's BTF when available.
+    /// Required for maps containing kptr fields (bpf_kptr_xchg).
+    pub btf_value_type_id: u32,
 }
 
 /// A BTF-defined map, most likely from a `.maps` section.

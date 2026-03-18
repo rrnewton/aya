@@ -862,6 +862,7 @@ impl Object {
                     symbol_index: Some(sym.index),
                     def,
                     data: Vec::new(),
+                    btf_value_type_id: 0,
                 }),
             );
             have_symbols = true;
@@ -1463,6 +1464,7 @@ fn parse_data_map_section(section: &Section<'_>) -> Map {
         symbol_index: None,
         def,
         data,
+        btf_value_type_id: 0,
     })
 }
 
@@ -1601,6 +1603,7 @@ pub const fn parse_map_info(info: bpf_map_info, pinned: PinningType) -> Map {
             symbol_index: None,
             section_kind: EbpfSectionKind::Undefined,
             data: Vec::new(),
+            btf_value_type_id: 0,
         })
     }
 }
@@ -1882,6 +1885,7 @@ mod tests {
                     pinning: PinningType::None,
                 },
                 data,
+                btf_value_type_id: 0,
             }) if data == map_data && value_size == map_data.len() as u32
         )
     }
@@ -2941,6 +2945,7 @@ mod tests {
                 section_kind: EbpfSectionKind::Rodata,
                 symbol_index: Some(1),
                 data: vec![0, 0, 0],
+                btf_value_type_id: 0,
             }),
         );
         obj.symbol_table.insert(

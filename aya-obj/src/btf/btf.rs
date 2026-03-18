@@ -25,6 +25,7 @@ use crate::{
         relocation::Relocation,
     },
     generated::{btf_ext_header, btf_header},
+    maps::Map,
     util::{HashMap, bytes_of},
 };
 
@@ -530,7 +531,7 @@ impl Btf {
         for (type_id, ty) in self.types.types.iter().enumerate() {
             if let BtfType::Struct(s) = ty {
                 let name = self.string_at(s.name_offset).unwrap_or_default();
-                if name == "Kptr" && s.members.len() == 1 {
+                if (name == "Kptr" || name.starts_with("Kptr_3C_")) && s.members.len() == 1 {
                     let member_type_id = s.members[0].btf_type;
                     // Check that the member is a PTR
                     if let Ok(BtfType::Ptr(ptr)) = self.types.type_by_id(member_type_id) {
@@ -987,6 +988,26 @@ impl Object {
             // Rewrite Kptr<T> wrapper structs into PTR -> TYPE_TAG("kptr") -> T
             // chains that the BPF verifier expects for kptr globals.
             obj_btf.fixup_kptr_types();
+
+            // Set btf_value_type_id on legacy data maps (.bss, .data, .rodata).
+            //
+            // The kernel requires BTF on maps that contain kptr fields
+            // (for bpf_kptr_xchg validation). libbpf does this in
+            // bpf_object__init_internal_map() by looking up the DATASEC
+            // type by the section name and setting btf_value_type_id.
+            //
+            // We iterate through DATASEC types and match them to legacy
+            // data maps by section name. This must happen AFTER
+            // fixup_kptr_types() which may modify the DATASEC entries.
+            for (type_id, t) in obj_btf.types().enumerate() {
+                if let BtfType::DataSec(_) = &t {
+                    if let Ok(name) = obj_btf.type_name(t) {
+                        if let Some(Map::Legacy(m)) = self.maps.get_mut(name.as_ref()) {
+                            m.btf_value_type_id = type_id as u32;
+                        }
+                    }
+                }
+            }
 
             // fixup btf
             obj_btf.fixup_and_sanitize(

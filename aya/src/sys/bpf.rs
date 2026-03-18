@@ -100,6 +100,17 @@ pub(crate) fn bpf_create_map(
                 u.btf_fd = btf_fd.map(|fd| fd.as_raw_fd()).unwrap_or_default() as u32;
             }
         }
+    } else if let aya_obj::Map::Legacy(m) = def {
+        // For legacy data section maps (.bss, .data, .rodata), set the BTF
+        // value type ID if available. This is required for maps containing
+        // kptr fields — the kernel's bpf_kptr_xchg validation checks that
+        // the map has BTF associated with it. libbpf does this in
+        // bpf_object__init_kern_struct_ops / init_internal_map.
+        if m.btf_value_type_id != 0 {
+            u.btf_value_type_id = m.btf_value_type_id;
+            u.btf_key_type_id = 0;
+            u.btf_fd = btf_fd.map(|fd| fd.as_raw_fd()).unwrap_or_default() as u32;
+        }
     }
 
     // https://github.com/torvalds/linux/commit/ad5b177bd73f5107d97c36f56395c4281fb6f089
@@ -978,6 +989,7 @@ pub(crate) fn is_bpf_global_data_supported() -> bool {
             section_kind: EbpfSectionKind::Maps,
             symbol_index: None,
             data: Vec::new(),
+            btf_value_type_id: 0,
         }),
         "aya_global",
         None,
