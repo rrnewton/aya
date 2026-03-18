@@ -372,6 +372,15 @@ impl<'a> FunctionLinker<'a> {
                             let ins = &mut program.instructions[ins_index];
                             ins.set_src_reg(BPF_PSEUDO_KFUNC_CALL as u8);
                             ins.imm = 0; // kernel resolves by BTF func name
+                            // Record the kfunc name for this instruction so
+                            // fixup_kfunc_calls can resolve it after linking,
+                            // even though the instruction is now at a different
+                            // offset/section than the original relocation.
+                            if let Some(name) = &sym.name {
+                                program
+                                    .kfunc_call_fixups
+                                    .push((ins_index, name.clone()));
+                            }
                             continue;
                         }
                     }
@@ -564,6 +573,7 @@ mod test {
             line_info: Default::default(),
             func_info_rec_size: Default::default(),
             line_info_rec_size: Default::default(),
+            kfunc_call_fixups: Vec::new(),
         }
     }
 
