@@ -552,14 +552,40 @@ impl Btf {
         // Phase 2: For each Kptr struct, create the replacement type chain:
         //   TYPE_TAG("kptr") -> T
         //   PTR -> TYPE_TAG
-        // We create one pair per unique Kptr struct instance.
+        //
+        // The kernel's btf_parse_kptr() requires the TYPE_TAG to point to a
+        // STRUCT or UNION (not a FWD). The Rust BPF compiler often emits
+        // opaque types (like bpf_cpumask) as FWD declarations since they're
+        // only used as pointer targets. When we find a FWD, we create an
+        // empty STRUCT with the same name to satisfy the kernel's check.
+        // The kernel will match it by name against vmlinux BTF.
         let mut replacements: Vec<(u32, u32)> = Vec::new(); // (kptr_struct_id, new_ptr_id)
 
         for &(kptr_struct_id, target_type_id) in &kptr_map {
-            // Add TYPE_TAG("kptr") pointing to T
+            // Check if the target is a FWD that needs to be replaced with a STRUCT
+            let actual_target_id = if let Ok(BtfType::Fwd(fwd)) = self.types.type_by_id(target_type_id) {
+                // The kernel rejects kptr chains ending in FWD — it requires
+                // STRUCT or UNION. Create an empty STRUCT with the same name.
+                let fwd_name_offset = fwd.name_offset;
+                let fwd_name = self.string_at(fwd_name_offset).unwrap_or_default().into_owned();
+                debug!(
+                    "fixup_kptr_types: replacing FWD '{}' (type {}) with empty STRUCT for kptr chain",
+                    fwd_name, target_type_id
+                );
+                let struct_id = self.add_type(BtfType::Struct(Struct::new(
+                    fwd_name_offset,
+                    Vec::new(),
+                    0,
+                )));
+                struct_id
+            } else {
+                target_type_id
+            };
+
+            // Add TYPE_TAG("kptr") pointing to the target (STRUCT, not FWD)
             let kptr_tag_name = self.add_string("kptr");
             let type_tag_id =
-                self.add_type(BtfType::TypeTag(TypeTag::new(kptr_tag_name, target_type_id)));
+                self.add_type(BtfType::TypeTag(TypeTag::new(kptr_tag_name, actual_target_id)));
 
             // Add PTR -> TYPE_TAG
             let new_ptr_id = self.add_type(BtfType::Ptr(Ptr::new(0, type_tag_id)));
