@@ -200,6 +200,14 @@ pub struct Function {
     pub func_info_rec_size: usize,
     /// Line info record size
     pub line_info_rec_size: usize,
+    /// Kfunc call fixups: maps instruction index to kfunc symbol name.
+    ///
+    /// Populated during `relocate_calls` when subprogram instructions containing
+    /// kfunc calls are appended to the main function. After linking, the original
+    /// section/offset-based relocation lookup would fail because the instructions
+    /// are at new offsets in a different section. This field preserves the mapping
+    /// so `fixup_kfunc_calls` can resolve the kfunc names correctly.
+    pub(crate) kfunc_call_fixups: Vec<(usize, String)>,
 }
 
 /// Section types containing eBPF programs
@@ -667,6 +675,7 @@ impl Object {
             line_info,
             func_info_rec_size,
             line_info_rec_size,
+            kfunc_call_fixups: Vec::new(),
         };
 
         Ok((
@@ -732,6 +741,7 @@ impl Object {
                     line_info,
                     func_info_rec_size,
                     line_info_rec_size,
+                    kfunc_call_fixups: Vec::new(),
                 },
             );
 
@@ -985,8 +995,18 @@ impl Object {
     ///
     /// After `relocate_calls` patches extern symbol calls to use
     /// `BPF_PSEUDO_KFUNC_CALL`, this method resolves the `imm` field
-    /// to the correct BTF func type ID by matching the relocation
-    /// symbol name against vmlinux BTF FUNC entries.
+    /// to the correct BTF func type ID by matching the kfunc symbol
+    /// name against vmlinux BTF FUNC entries.
+    ///
+    /// Kfunc names are determined from two sources:
+    /// 1. `kfunc_call_fixups` — recorded during `relocate_calls` when
+    ///    subprogram instructions are linked into the main function.
+    ///    This is the primary mechanism and handles the case where
+    ///    instructions have moved to new offsets/sections after linking.
+    /// 2. Relocation table lookup — fallback using the original
+    ///    `(section_index, offset)` for instructions that are still
+    ///    at their original positions (i.e., in the main function body,
+    ///    not appended subprograms).
     ///
     /// `kernel_btf` should be the vmlinux BTF loaded from `/sys/kernel/btf/vmlinux`.
     pub fn fixup_kfunc_calls(&mut self, kernel_btf: &Btf) {
@@ -1011,7 +1031,15 @@ impl Object {
             return;
         }
 
+        // Patch kfunc call instructions with vmlinux BTF func IDs.
+        //
+        // For each function, first build a map from instruction index to
+        // kfunc name using kfunc_call_fixups (populated during linking).
+        // Then scan instructions and resolve any BPF_PSEUDO_KFUNC_CALL
+        // using either the fixup map or the relocation table as fallback.
+
         // Build relocation (section_index, offset) → symbol name map
+        // as fallback for instructions still at original positions
         let mut extern_call_names: BTreeMap<(usize, u64), String> = BTreeMap::new();
         for (section_index, relocations) in &self.relocations {
             for (offset, rel) in relocations {
@@ -1026,8 +1054,14 @@ impl Object {
             }
         }
 
-        // Patch kfunc call instructions with vmlinux BTF func IDs
         for function in self.functions.values_mut() {
+            // Build instruction index → kfunc name from fixups
+            let fixup_map: BTreeMap<usize, &str> = function
+                .kfunc_call_fixups
+                .iter()
+                .map(|(idx, name)| (*idx, name.as_str()))
+                .collect();
+
             for (ins_idx, ins) in function.instructions.iter_mut().enumerate() {
                 let klass = u32::from(ins.code & 0x07);
                 let op = u32::from(ins.code & 0xF0);
@@ -1038,10 +1072,18 @@ impl Object {
                     && src == BPF_K
                     && u32::from(ins.src_reg()) == BPF_PSEUDO_KFUNC_CALL
                 {
-                    let offset =
-                        (function.section_offset + ins_idx * INS_SIZE) as u64;
-                    let key = (function.section_index.0, offset);
-                    if let Some(name) = extern_call_names.get(&key) {
+                    // Try fixup map first (handles linked subprogram instructions)
+                    let kfunc_name = if let Some(name) = fixup_map.get(&ins_idx) {
+                        Some(*name)
+                    } else {
+                        // Fallback: relocation table lookup (original offsets)
+                        let offset =
+                            (function.section_offset + ins_idx * INS_SIZE) as u64;
+                        let key = (function.section_index.0, offset);
+                        extern_call_names.get(&key).map(String::as_str)
+                    };
+
+                    if let Some(name) = kfunc_name {
                         if let Some(&vmlinux_id) = kfunc_vmlinux_ids.get(name) {
                             ins.imm = vmlinux_id as i32;
                         }
@@ -3077,5 +3119,232 @@ mod tests {
             assert!(m.auto_attach);
             assert_eq!(m.data.len(), 16);
         });
+    }
+
+    #[test]
+    fn test_kfunc_in_subprogram_resolved_after_linking() {
+        // This test verifies that kfunc calls inside subprograms (functions
+        // created by `#[inline(never)]`) are correctly resolved after
+        // `relocate_calls()` links them into the main program function.
+        //
+        // Setup:
+        //   Section 0 (kprobe): main function with 2 instructions:
+        //     [0] nop instruction
+        //     [1] BPF_PSEUDO_CALL to subprogram (relocation-based)
+        //   Section 1 (.text): subprogram with 2 instructions:
+        //     [0] nop instruction
+        //     [1] BPF_PSEUDO_CALL to kfunc (relocation to extern symbol)
+        //
+        // After relocate_calls(), the main function has 4 instructions:
+        //   [0] nop (main)
+        //   [1] call to ins 2 (linked subprogram)
+        //   [2] nop (from subprogram)
+        //   [3] kfunc call (from subprogram, src_reg = BPF_PSEUDO_KFUNC_CALL)
+        //
+        // fixup_kfunc_calls() must resolve instruction [3]'s imm to the
+        // vmlinux BTF func ID, even though it's now in section 0's function
+        // at a different offset than the original relocation in section 1.
+
+        use crate::btf::{Btf, BtfType, Func, FuncLinkage, FuncProto};
+        use crate::generated::{BPF_CALL, BPF_JMP, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
+        use crate::relocation::INS_SIZE;
+        use crate::util::HashSet;
+
+        let mut obj = fake_obj();
+
+        // --- Symbol table ---
+        // Symbol 1: main function (section 0, address 0, size 2 instructions)
+        let main_sym_idx = 1;
+        obj.symbol_table.insert(
+            main_sym_idx,
+            Symbol {
+                index: main_sym_idx,
+                section_index: Some(0),
+                name: Some("main_prog".to_string()),
+                address: 0,
+                size: (2 * INS_SIZE) as u64,
+                is_definition: true,
+                kind: SymbolKind::Text,
+            },
+        );
+        obj.symbols_by_section
+            .entry(SectionIndex(0))
+            .or_default()
+            .push(main_sym_idx);
+
+        // Symbol 2: subprogram (section 1 = .text, address 0, size 2 instructions)
+        let sub_sym_idx = 2;
+        obj.symbol_table.insert(
+            sub_sym_idx,
+            Symbol {
+                index: sub_sym_idx,
+                section_index: Some(1),
+                name: Some("my_subprog".to_string()),
+                address: 0,
+                size: (2 * INS_SIZE) as u64,
+                is_definition: true,
+                kind: SymbolKind::Text,
+            },
+        );
+        obj.symbols_by_section
+            .entry(SectionIndex(1))
+            .or_default()
+            .push(sub_sym_idx);
+
+        // Symbol 3: extern kfunc (no section, undefined)
+        let kfunc_sym_idx = 3;
+        obj.symbol_table.insert(
+            kfunc_sym_idx,
+            Symbol {
+                index: kfunc_sym_idx,
+                section_index: None,
+                name: Some("bpf_test_kfunc".to_string()),
+                address: 0,
+                size: 0,
+                is_definition: false,
+                kind: SymbolKind::Text,
+            },
+        );
+
+        // --- Instructions ---
+        let nop_ins = fake_ins();
+
+        // Call instruction (BPF_JMP | BPF_CALL, src_reg = BPF_PSEUDO_CALL)
+        let call_ins = bpf_insn {
+            code: (BPF_JMP | BPF_CALL) as u8,
+            _bitfield_align_1: [],
+            _bitfield_1: bpf_insn::new_bitfield_1(0, BPF_PSEUDO_CALL as u8),
+            off: 0,
+            imm: 0, // will be resolved by relocation
+        };
+
+        // Main function: [nop, call_to_subprog]
+        let main_func = Function {
+            address: 0,
+            name: "main_prog".to_string(),
+            section_index: SectionIndex(0),
+            section_offset: 0,
+            instructions: vec![nop_ins, call_ins],
+            func_info: Default::default(),
+            line_info: Default::default(),
+            func_info_rec_size: Default::default(),
+            line_info_rec_size: Default::default(),
+            kfunc_call_fixups: Vec::new(),
+        };
+
+        // Subprogram: [nop, kfunc_call]
+        let sub_func = Function {
+            address: 0,
+            name: "my_subprog".to_string(),
+            section_index: SectionIndex(1),
+            section_offset: 0,
+            instructions: vec![nop_ins, call_ins],
+            func_info: Default::default(),
+            line_info: Default::default(),
+            func_info_rec_size: Default::default(),
+            line_info_rec_size: Default::default(),
+            kfunc_call_fixups: Vec::new(),
+        };
+
+        // Insert functions keyed by (section_index, address)
+        obj.functions.insert((0, 0), main_func);
+        obj.functions.insert((1, 0), sub_func);
+
+        // --- Relocations ---
+        // Section 0, offset = 1 * INS_SIZE: call to subprogram
+        let mut sec0_relocs = HashMap::new();
+        sec0_relocs.insert(
+            (1 * INS_SIZE) as u64,
+            Relocation {
+                offset: (1 * INS_SIZE) as u64,
+                size: 32,
+                symbol_index: sub_sym_idx,
+            },
+        );
+        obj.relocations.insert(SectionIndex(0), sec0_relocs);
+
+        // Section 1, offset = 1 * INS_SIZE: call to extern kfunc
+        let mut sec1_relocs = HashMap::new();
+        sec1_relocs.insert(
+            (1 * INS_SIZE) as u64,
+            Relocation {
+                offset: (1 * INS_SIZE) as u64,
+                size: 32,
+                symbol_index: kfunc_sym_idx,
+            },
+        );
+        obj.relocations.insert(SectionIndex(1), sec1_relocs);
+
+        // --- Program ---
+        obj.programs.insert(
+            "main_prog".to_string(),
+            Program {
+                license: CString::new("GPL").unwrap(),
+                kernel_version: None,
+                section: ProgramSection::KProbe,
+                section_index: 0,
+                address: 0,
+            },
+        );
+
+        // --- Step 1: relocate_calls ---
+        let mut text_sections = HashSet::new();
+        text_sections.insert(1usize);
+        obj.relocate_calls(&text_sections).unwrap();
+
+        // Verify the main function now has 4 instructions (2 original + 2 from subprogram)
+        let main_func = obj.functions.get(&(0, 0)).unwrap();
+        assert_eq!(
+            main_func.instructions.len(),
+            4,
+            "main function should have 4 instructions after linking"
+        );
+
+        // Instruction 3 should be the kfunc call with src_reg = BPF_PSEUDO_KFUNC_CALL
+        let kfunc_ins = main_func.instructions[3];
+        assert_eq!(
+            u32::from(kfunc_ins.src_reg()),
+            BPF_PSEUDO_KFUNC_CALL,
+            "instruction 3 should have src_reg = BPF_PSEUDO_KFUNC_CALL"
+        );
+        assert_eq!(
+            kfunc_ins.imm, 0,
+            "kfunc imm should be 0 before fixup_kfunc_calls"
+        );
+
+        // Verify kfunc_call_fixups was populated
+        assert_eq!(
+            main_func.kfunc_call_fixups.len(),
+            1,
+            "should have 1 kfunc_call_fixup entry"
+        );
+        assert_eq!(main_func.kfunc_call_fixups[0].0, 3, "fixup should be at instruction index 3");
+        assert_eq!(
+            main_func.kfunc_call_fixups[0].1, "bpf_test_kfunc",
+            "fixup should reference the kfunc name"
+        );
+
+        // --- Step 2: fixup_kfunc_calls ---
+        // Create a fake vmlinux BTF with the kfunc FUNC entry
+        let mut kernel_btf = Btf::new();
+        // Type 0 is the void type (implicit), so we start at type 1
+        // Add a FuncProto (type 1) as the prototype for the kfunc
+        let func_proto = FuncProto::new(vec![], 0); // void return, 0 params
+        let proto_type_id = kernel_btf.add_type(BtfType::FuncProto(func_proto));
+        // Add a Func (type 2) for the kfunc
+        let func_name_offset = kernel_btf.add_string("bpf_test_kfunc");
+        let func = Func::new(func_name_offset, proto_type_id, FuncLinkage::Global);
+        let expected_btf_id = kernel_btf.add_type(BtfType::Func(func));
+
+        obj.fixup_kfunc_calls(&kernel_btf);
+
+        // Verify the kfunc instruction now has the correct BTF type ID
+        let main_func = obj.functions.get(&(0, 0)).unwrap();
+        let kfunc_ins = main_func.instructions[3];
+        assert_eq!(
+            kfunc_ins.imm, expected_btf_id as i32,
+            "kfunc imm should be resolved to vmlinux BTF func type ID {expected_btf_id}, got {}",
+            kfunc_ins.imm
+        );
     }
 }
