@@ -15,6 +15,11 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true, default-features = true }
+aya-core-postprocessor = { path = "../aya-core-postprocessor", optional = true }
 cargo_metadata = { workspace = true }
 rustc_version = { workspace = true }
 which = { workspace = true, features = ["real-sys"] }
+
+[features]
+default = []
+core-postprocess = ["aya-core-postprocessor"]

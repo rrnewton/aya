@@ -123,6 +123,46 @@ impl<'a> BtfExtWriter<'a> {
         Ok(())
     }
 
+    /// Adds a CO-RE relocation with a pre-computed type_id and access string.
+    ///
+    /// This is used by the auto-discovery path where the type_id comes from
+    /// a struct that was imported into the program's BTF from vmlinux, and
+    /// the access string was computed from the vmlinux BTF.
+    pub fn add_relocation_with_type_id(
+        &mut self,
+        entry: &RelocationEntry,
+        type_id: u32,
+        access_str: &str,
+    ) -> Result<()> {
+        eprintln!(
+            "  relo: section={} insn={} type={}(id={}) path={} -> access_str={}",
+            entry.section, entry.insn_index, entry.struct_name, type_id, entry.field_path,
+            access_str
+        );
+
+        let record = CoreReloRecord {
+            insn_off: entry.insn_index * BPF_INSN_SIZE,
+            type_id,
+            // access_str_off will be filled in during finish()
+            access_str_off: 0,
+            kind: BPF_CORE_FIELD_BYTE_OFFSET,
+        };
+
+        // Group by section name.
+        if let Some(group) = self.new_relos.iter_mut().find(|(s, _)| s == &entry.section) {
+            group.1.push(record);
+        } else {
+            self.new_relos
+                .push((entry.section.clone(), vec![record]));
+        }
+
+        // Remember the access string for later string table addition.
+        self.added_strings
+            .push((access_str.to_string(), 0 /* placeholder */));
+
+        Ok(())
+    }
+
     /// Finalizes the BTF.ext data, producing the new .BTF and .BTF.ext
     /// section contents.
     ///
@@ -368,6 +408,7 @@ mod tests {
                 types: vec![],
                 strings: vec![0],
                 raw_header_len: 24,
+                appended_type_data: Vec::new(),
             },
             existing_ext_data: None,
             new_relos: Vec::new(),

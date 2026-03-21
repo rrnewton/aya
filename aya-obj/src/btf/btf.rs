@@ -631,6 +631,7 @@ impl Btf {
                     let name = self.string_at(d.name_offset).unwrap_or_default();
                     if name == ".ksyms"
                         || name.starts_with(".struct_ops")
+                        || name.starts_with(".aya.")
                     {
                         // Replace unsupported DATASEC with INT placeholder
                         let placeholder =
@@ -742,6 +743,7 @@ impl Btf {
                         debug!("{kind} {name}: size fixup not required");
                     } else if name == ".ksyms"
                         || name.starts_with(".struct_ops")
+                        || name.starts_with(".aya.")
                     {
                         // Virtual sections without ELF backing; sanitized in to_bytes().
                         debug!("{kind} {name}: skipping fixup (sanitized in to_bytes)");
