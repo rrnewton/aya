@@ -267,10 +267,25 @@ pub fn build_ebpf<'a>(
         }
 
         for (name, binary) in executables {
-            let dst = out_dir.join(name);
+            let dst = out_dir.join(&name);
             let _: u64 = fs::copy(&binary, &dst).with_context(|| {
                 format!("failed to copy {} to {}", binary.display(), dst.display())
             })?;
+
+            // Run CO-RE postprocessor to convert .aya.core_relo markers
+            // into .BTF.ext relocation records (if enabled and markers present).
+            #[cfg(feature = "core-postprocess")]
+            {
+                match aya_core_postprocessor::postprocess_core_relos(&dst) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        println!(
+                            "cargo:warning=CO-RE postprocessor failed for {}: {e:#}",
+                            name,
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())

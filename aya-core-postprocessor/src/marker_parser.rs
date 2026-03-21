@@ -37,20 +37,33 @@ pub struct CoreReloMarker {
     pub field_path: String,
 }
 
-/// Parses all marker records from an `.aya.core_relo` ELF section.
+/// Parses all marker records from `.aya.core_relo` ELF sections.
 ///
-/// Returns `Ok(vec![])` if the section does not exist.
+/// The BPF linker may create multiple sections with the same name
+/// (one per `#[link_section]` static).  This function reads all of
+/// them.
+///
+/// Returns `Ok(vec![])` if no such sections exist.
 pub fn parse_markers_from_elf(elf_data: &[u8]) -> Result<Vec<CoreReloMarker>> {
     let obj = ElfFile::<elf::FileHeader64<Endianness>>::parse(elf_data)
         .context("parsing ELF for .aya.core_relo")?;
 
-    let section = match obj.section_by_name(".aya.core_relo") {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
-    };
+    let mut all_markers = Vec::new();
 
-    let data = section.data().context("reading .aya.core_relo data")?;
-    parse_markers(data)
+    for section in obj.sections() {
+        let name = match section.name() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if name != ".aya.core_relo" {
+            continue;
+        }
+        let data = section.data().context("reading .aya.core_relo data")?;
+        let markers = parse_markers(data)?;
+        all_markers.extend(markers);
+    }
+
+    Ok(all_markers)
 }
 
 /// Parses marker records from raw section data.

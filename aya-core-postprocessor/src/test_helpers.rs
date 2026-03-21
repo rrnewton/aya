@@ -864,13 +864,26 @@ mod tests {
         //
         // The auto-discovery pipeline should:
         //   1. Read the marker
-        //   2. Compute byte offset = 12
+        //   2. Compute byte offset = 12 (from vmlinux BTF)
         //   3. Find the ALU64 ADD IMM=12 instruction at insn index 2
         //   4. Generate a CO-RE relocation for it
 
         let elf = build_test_elf_with_markers_and_insns();
 
-        let result = crate::process_elf_auto(&elf).unwrap();
+        // Extract the BTF section data to use as a fake vmlinux BTF file.
+        // The test ELF contains real struct definitions that the postprocessor
+        // needs for field resolution.
+        let btf = crate::btf_parser::BtfInfo::parse_from_elf(&elf).unwrap();
+        let vmlinux_btf_data = btf.to_bytes(&elf).unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let vmlinux_path = tmp_dir.path().join("vmlinux_btf");
+        std::fs::write(&vmlinux_path, &vmlinux_btf_data).unwrap();
+
+        let result = crate::process_elf_auto_with_vmlinux(
+            &elf,
+            vmlinux_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         // Verify the result has a .BTF.ext section with a CO-RE relocation.
         assert_eq!(&result[0..4], &[0x7f, b'E', b'L', b'F']);
@@ -921,9 +934,16 @@ mod tests {
                 let insn_off = read_u32_le(relo_data, 12);
                 assert_eq!(insn_off, 16, "insn_off should be 16 (insn index 2)");
 
-                // Check type_id = 4 (outer_struct)
+                // Check type_id points to outer_struct (the exact ID depends
+                // on whether structs were imported from vmlinux or already
+                // present in the program's BTF)
                 let type_id = read_u32_le(relo_data, 16);
-                assert_eq!(type_id, 4);
+                let btf_check = BtfInfo::parse_from_elf(&result).unwrap();
+                let type_name = match &btf_check.types[type_id as usize] {
+                    crate::btf_parser::BtfType::Struct(c, _) => btf_check.string_at(c.name_off).unwrap(),
+                    _ => panic!("type_id {} should be a struct", type_id),
+                };
+                assert_eq!(type_name, "outer_struct");
 
                 // Check kind = 0 (BPF_CORE_FIELD_BYTE_OFFSET)
                 let kind = read_u32_le(relo_data, 24);
@@ -933,7 +953,7 @@ mod tests {
                 let btf = BtfInfo::parse_from_elf(&result).unwrap();
                 let access_str_off = read_u32_le(relo_data, 20);
                 let access_str = btf.string_at(access_str_off).unwrap();
-                assert_eq!(access_str, "0:1:1"); // nested=1, field_b=1
+                assert_eq!(access_str, "0:0:0"); // nested=0, field_b=0 (stub structs have only accessed fields)
 
                 break;
             }

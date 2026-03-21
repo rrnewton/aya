@@ -18,6 +18,10 @@ pub struct BtfInfo {
     pub strings: Vec<u8>,
     /// The raw header bytes (for reconstruction)
     pub raw_header_len: usize,
+    /// Additional raw type data appended after the original types.
+    /// These bytes are concatenated with the original type data during
+    /// `to_bytes()`.
+    pub appended_type_data: Vec<u8>,
 }
 
 /// BTF file header.
@@ -183,6 +187,7 @@ impl BtfInfo {
             types,
             strings,
             raw_header_len: hdr_len,
+            appended_type_data: Vec::new(),
         })
     }
 
@@ -456,6 +461,91 @@ impl BtfInfo {
         offset
     }
 
+    /// Returns the next type_id that would be assigned to a newly added type.
+    pub fn next_type_id(&self) -> u32 {
+        self.types.len() as u32
+    }
+
+    /// Adds a struct type with the given name and members to the BTF.
+    ///
+    /// Each member is `(name, type_id, bit_offset)`.
+    ///
+    /// Returns the type_id of the newly added struct.
+    pub fn add_struct(
+        &mut self,
+        name: &str,
+        size: u32,
+        members: &[(&str, u32, u32)],
+    ) -> u32 {
+        let type_id = self.next_type_id();
+
+        let name_off = self.add_string(name);
+        let vlen = members.len() as u32;
+        // kind=4 (STRUCT), vlen=member count
+        let info = (BTF_KIND_STRUCT << 24) | vlen;
+
+        // Serialize the type header: name_off(4) + info(4) + size(4)
+        self.appended_type_data.extend_from_slice(&name_off.to_le_bytes());
+        self.appended_type_data.extend_from_slice(&info.to_le_bytes());
+        self.appended_type_data.extend_from_slice(&size.to_le_bytes());
+
+        // Serialize members: name_off(4) + type_id(4) + offset(4) each
+        let mut parsed_members = Vec::with_capacity(members.len());
+        for &(member_name, member_type_id, bit_offset) in members {
+            let m_name_off = self.add_string(member_name);
+            self.appended_type_data.extend_from_slice(&m_name_off.to_le_bytes());
+            self.appended_type_data.extend_from_slice(&member_type_id.to_le_bytes());
+            self.appended_type_data.extend_from_slice(&bit_offset.to_le_bytes());
+
+            parsed_members.push(BtfMember {
+                name_off: m_name_off,
+                type_id: member_type_id,
+                offset: bit_offset,
+            });
+        }
+
+        // Also add to the in-memory type list for subsequent lookups.
+        let common = BtfTypeCommon {
+            name_off,
+            info,
+            size_or_type: size,
+        };
+        self.types.push(BtfType::Struct(common, parsed_members));
+
+        type_id
+    }
+
+    /// Adds a BTF_KIND_INT type (used as a placeholder for leaf member types).
+    ///
+    /// Returns the type_id of the newly added int type.
+    pub fn add_int(&mut self, name: &str, size: u32) -> u32 {
+        let type_id = self.next_type_id();
+
+        let name_off = self.add_string(name);
+        // kind=1 (INT), vlen=0
+        let info = BTF_KIND_INT << 24;
+
+        // Type header: name_off(4) + info(4) + size(4)
+        self.appended_type_data.extend_from_slice(&name_off.to_le_bytes());
+        self.appended_type_data.extend_from_slice(&info.to_le_bytes());
+        self.appended_type_data.extend_from_slice(&size.to_le_bytes());
+
+        // INT has 4 extra bytes encoding bits and offset:
+        //   bits_offset | (bits << 16) | (encoding << 24)
+        let int_data: u32 = (size * 8) << 16; // bits = size*8, offset=0, encoding=0
+        self.appended_type_data.extend_from_slice(&int_data.to_le_bytes());
+
+        // Add to in-memory type list
+        let common = BtfTypeCommon {
+            name_off,
+            info,
+            size_or_type: size,
+        };
+        self.types.push(BtfType::Int(common));
+
+        type_id
+    }
+
     /// Given a struct type_id and a dot-separated field path like
     /// "scx.dsq_vtime", returns the byte offset of the field within the
     /// struct.
@@ -562,8 +652,8 @@ impl BtfInfo {
 
     /// Serializes the BTF data (header + types + strings) back to bytes.
     ///
-    /// This re-encodes the original type data from the raw ELF and appends
-    /// the (possibly extended) string table.
+    /// This re-encodes the original type data from the raw ELF, appends
+    /// any newly added types, and writes the (possibly extended) string table.
     pub fn to_bytes(&self, original_elf: &[u8]) -> Result<Vec<u8>> {
         let obj = ElfFile::<elf::FileHeader64<Endianness>>::parse(original_elf)
             .context("re-parsing ELF for BTF rebuild")?;
@@ -577,8 +667,13 @@ impl BtfInfo {
         // Copy the original type data verbatim
         let type_data = &btf_data[type_start..type_end];
 
-        // Build new header with updated string length
+        // Compute new type_len including appended types
+        let new_type_len = self.header.type_len + self.appended_type_data.len() as u32;
+
+        // Build new header with updated lengths
         let mut header = self.header;
+        header.type_len = new_type_len;
+        header.str_off = header.type_off + new_type_len;
         header.str_len = self.strings.len() as u32;
 
         let mut buf = Vec::new();
@@ -597,6 +692,7 @@ impl BtfInfo {
         }
 
         buf.extend_from_slice(type_data);
+        buf.extend_from_slice(&self.appended_type_data);
         buf.extend_from_slice(&self.strings);
 
         Ok(buf)
@@ -623,6 +719,7 @@ mod tests {
             types: vec![BtfType::Void],
             strings: vec![0], // empty string at offset 0
             raw_header_len: 24,
+            appended_type_data: Vec::new(),
         };
 
         let off = btf.add_string("0:3:7");
