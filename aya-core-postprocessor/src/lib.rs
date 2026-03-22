@@ -97,10 +97,13 @@ pub fn process_elf_auto_with_vmlinux(
     }
 
     // Load vmlinux BTF for struct resolution.
+    // Supports both raw BTF (e.g., /sys/kernel/btf/vmlinux) and ELF format
+    // (e.g., /lib/modules/*/build/vmlinux) by extracting the .BTF section.
     let vmlinux_data = std::fs::read(vmlinux_path)
         .with_context(|| format!("reading vmlinux BTF: {vmlinux_path}"))?;
     let vmlinux_btf = BtfInfo::parse(&vmlinux_data)
-        .context("parsing vmlinux BTF")?;
+        .or_else(|_| BtfInfo::parse_from_elf(&vmlinux_data))
+        .context("parsing vmlinux BTF (tried both raw BTF and ELF formats)")?;
 
     // Load program BTF (we'll add struct definitions to it).
     let mut prog_btf = BtfInfo::parse_from_elf(elf_data)
