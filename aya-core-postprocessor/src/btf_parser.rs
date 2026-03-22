@@ -531,8 +531,8 @@ impl BtfInfo {
         self.appended_type_data.extend_from_slice(&size.to_le_bytes());
 
         // INT has 4 extra bytes encoding bits and offset:
-        //   bits_offset | (bits << 16) | (encoding << 24)
-        let int_data: u32 = (size * 8) << 16; // bits = size*8, offset=0, encoding=0
+        //   (encoding << 24) | (offset << 16) | bits
+        let int_data: u32 = size * 8; // bits = size*8, offset=0, encoding=0
         self.appended_type_data.extend_from_slice(&int_data.to_le_bytes());
 
         // Add to in-memory type list
