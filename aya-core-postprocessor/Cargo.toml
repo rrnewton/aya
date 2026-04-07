@@ -23,10 +23,21 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true, default-features = true }
-clap = { workspace = true, features = ["derive", "std"] }
 object = { workspace = true, features = ["elf", "read", "write"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+
+[dependencies.clap]
+workspace = true
+features = ["derive", "std"]
+optional = true
+
+[dependencies.toml]
+version = "0.8"
+optional = true
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:toml"]
 
 [dev-dependencies]
 tempfile = { workspace = true, default-features = true }

@@ -128,7 +128,7 @@ pub fn patch_elf_sections(
     let mut new_offsets: Vec<NewSection> = Vec::with_capacity(total_sections);
 
     for (i, sec) in sections.iter().enumerate() {
-        let name = section_name(sec);
+        let _name = section_name(sec);
 
         // SHT_NULL (index 0) has no data.
         if sec.sh_type == 0 {
@@ -215,7 +215,7 @@ pub fn patch_elf_sections(
     let new_shoff = output.len();
 
     // 4. Write section headers.
-    for (i, new_sec) in new_offsets.iter().enumerate() {
+    for (_i, new_sec) in new_offsets.iter().enumerate() {
         if new_sec.original_index == usize::MAX {
             // New .BTF.ext section header.
             let mut shdr = [0u8; ELF64_SHDR_SIZE];
@@ -254,6 +254,7 @@ pub fn patch_elf_sections(
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct SectionInfo {
     sh_name: u32,
     sh_type: u32,
