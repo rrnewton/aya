@@ -1009,6 +1009,7 @@ mod test_utils {
             section_kind: EbpfSectionKind::Maps,
             data: Vec::new(),
             symbol_index: None,
+            btf_value_type_id: 0,
         })
     }
 
@@ -1028,6 +1029,7 @@ mod test_utils {
             section_kind: EbpfSectionKind::Maps,
             data: Vec::new(),
             symbol_index: None,
+            btf_value_type_id: 0,
         })
     }
 }
