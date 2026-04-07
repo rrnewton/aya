@@ -42,6 +42,8 @@ pub mod btf_maps;
     reason = "helpers mirror kernel helpers with implicit safety contracts"
 )]
 pub mod helpers;
+#[cfg(target_arch = "bpf")]
+pub mod kfuncs;
 pub mod maps;
 pub mod programs;
 

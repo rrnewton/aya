@@ -24,6 +24,9 @@ members = [
     "ebpf/aya-ebpf-cty",
     "ebpf/aya-log-ebpf",
     "test/integration-ebpf",
+
+    # arena shared types (usable from both BPF and userspace)
+    "aya-arena-common",
 ]
 
 resolver = "2"
@@ -45,6 +48,9 @@ default-members = [
 
     "aya-ebpf-macros",
     "aya-log-ebpf-macros",
+
+    # arena shared types
+    "aya-arena-common",
 
     # ebpf crates are omitted; they must be built with:
     #
