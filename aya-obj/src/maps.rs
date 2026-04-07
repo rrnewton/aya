@@ -321,7 +321,7 @@ pub struct LegacyMap {
     /// BTF value type id for data section maps (.bss, .data, .rodata).
     ///
     /// Set to the DATASEC type ID from the program's BTF when available.
-    /// Required for maps containing kptr fields (bpf_kptr_xchg).
+    /// Required for maps containing kptr fields (`bpf_kptr_xchg`).
     pub btf_value_type_id: u32,
 }
 
