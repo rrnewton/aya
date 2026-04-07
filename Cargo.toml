@@ -30,6 +30,9 @@ members = [
 
     # arena PoC test
     "test/arena-poc",
+
+    # arena benchmarks
+    "test/arena-bench",
 ]
 
 resolver = "2"
