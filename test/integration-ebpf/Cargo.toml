@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 aya-ebpf = { path = "../../ebpf/aya-ebpf" }
+aya-arena-common = { path = "../../aya-arena-common" }
 aya-log-ebpf = { path = "../../ebpf/aya-log-ebpf" }
 ebpf-panic = { path = "../../ebpf-panic" }
 integration-common = { path = "../integration-common" }

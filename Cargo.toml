@@ -27,6 +27,9 @@ members = [
 
     # arena shared types (usable from both BPF and userspace)
     "aya-arena-common",
+
+    # arena PoC test
+    "test/arena-poc",
 ]
 
 resolver = "2"
