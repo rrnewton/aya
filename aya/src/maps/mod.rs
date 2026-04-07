@@ -73,6 +73,7 @@ use crate::{
 
 pub mod array;
 pub mod bloom_filter;
+pub mod cgrp_storage;
 pub mod hash_map;
 mod info;
 pub mod lpm_trie;
@@ -87,6 +88,7 @@ pub mod xdp;
 
 pub use array::{Array, PerCpuArray, ProgramArray};
 pub use bloom_filter::BloomFilter;
+pub use cgrp_storage::CgrpStorage;
 pub use hash_map::{HashMap, PerCpuHashMap};
 pub use info::{MapInfo, MapType, loaded_maps};
 pub use lpm_trie::LpmTrie;
@@ -238,6 +240,8 @@ pub enum Map {
     Array(MapData),
     /// A [`BloomFilter`] map.
     BloomFilter(MapData),
+    /// A [`CgrpStorage`] map.
+    CgrpStorage(MapData),
     /// A [`CpuMap`] map.
     CpuMap(MapData),
     /// A [`DevMap`] map.
@@ -286,6 +290,7 @@ impl Map {
         match self {
             Self::Array(map) => map.obj.map_type(),
             Self::BloomFilter(map) => map.obj.map_type(),
+            Self::CgrpStorage(map) => map.obj.map_type(),
             Self::CpuMap(map) => map.obj.map_type(),
             Self::DevMap(map) => map.obj.map_type(),
             Self::DevMapHash(map) => map.obj.map_type(),
@@ -317,6 +322,7 @@ impl Map {
         match self {
             Self::Array(map) => map.pin(path),
             Self::BloomFilter(map) => map.pin(path),
+            Self::CgrpStorage(map) => map.pin(path),
             Self::CpuMap(map) => map.pin(path),
             Self::DevMap(map) => map.pin(path),
             Self::DevMapHash(map) => map.pin(path),
@@ -383,7 +389,7 @@ impl Map {
             bpf_map_type::BPF_MAP_TYPE_INODE_STORAGE => Self::Unsupported(map_data),
             bpf_map_type::BPF_MAP_TYPE_TASK_STORAGE => Self::Unsupported(map_data),
             bpf_map_type::BPF_MAP_TYPE_USER_RINGBUF => Self::Unsupported(map_data),
-            bpf_map_type::BPF_MAP_TYPE_CGRP_STORAGE => Self::Unsupported(map_data),
+            bpf_map_type::BPF_MAP_TYPE_CGRP_STORAGE => Self::CgrpStorage(map_data),
             bpf_map_type::BPF_MAP_TYPE_ARENA => Self::Unsupported(map_data),
             bpf_map_type::BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE_DEPRECATED => {
                 Self::Unsupported(map_data)
@@ -436,6 +442,7 @@ impl_map_pin!((V) {
     PerCpuArray,
     SockHash,
     BloomFilter,
+    CgrpStorage,
     Queue,
     SkStorage,
     Stack,
@@ -513,6 +520,7 @@ impl_try_from_map!(() {
 impl_try_from_map!((V) {
     Array,
     BloomFilter,
+    CgrpStorage,
     PerCpuArray,
     Queue,
     SockHash,
