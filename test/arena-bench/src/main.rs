@@ -6,7 +6,7 @@
 
 use aya_arena_common::{
     ArenaBTreeMap, ArenaBumpState, ArenaHashEntry, ArenaHashMap, ArenaNodeHeader, ArenaPtr,
-    BTreeNode, CounterNode, arena_btree_for_each, arena_btree_get, arena_btree_init,
+    CounterNode, arena_btree_for_each, arena_btree_get, arena_btree_init,
     arena_btree_insert, arena_hash_delete, arena_hash_get, arena_hash_init, arena_hash_insert,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -466,7 +466,7 @@ fn bench_std_btree_insert(count: u32) -> BenchResult {
 }
 
 fn bench_btree_lookup(count: u32) -> BenchResult {
-    let mut fix = BTreeFixture::new();
+    let fix = BTreeFixture::new();
     for i in 0..count {
         unsafe {
             arena_btree_insert(fix.map, fix.bump, (i as u64) * 7 + 1, i as u64, fix.base);
@@ -510,7 +510,7 @@ fn bench_std_btree_lookup(count: u32) -> BenchResult {
 }
 
 fn bench_btree_iterate(count: u32) -> BenchResult {
-    let mut fix = BTreeFixture::new();
+    let fix = BTreeFixture::new();
     for i in 0..count {
         unsafe {
             arena_btree_insert(fix.map, fix.bump, (i as u64) * 7 + 1, i as u64, fix.base);
@@ -544,7 +544,7 @@ fn bench_std_btree_iterate(count: u32) -> BenchResult {
     let ops = count as u64;
     let elapsed = bench(1, || {
         let mut sum: u64 = 0;
-        for (_k, &v) in &map {
+        for &v in map.values() {
             sum += v;
         }
         std::hint::black_box(sum);
