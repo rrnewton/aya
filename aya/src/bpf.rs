@@ -523,7 +523,20 @@ impl<'a> EbpfLoader<'a> {
                     error,
                 })? as u32)
             };
-            let map_type: bpf_map_type = obj.map_type().try_into().map_err(MapError::from)?;
+            let map_type: bpf_map_type = match obj.map_type().try_into() {
+                Ok(t) => t,
+                Err(_) if *allow_unsupported_maps => {
+                    // Unknown map type — skip creation entirely.
+                    // The map won't be accessible via Ebpf::map() but won't
+                    // block loading of the rest of the BPF object.
+                    log::debug!(
+                        "skipping map '{}' with unknown type {} during load",
+                        name, obj.map_type(),
+                    );
+                    continue;
+                }
+                Err(e) => return Err(MapError::from(e).into()),
+            };
             if let Some(max_entries) = max_entries_override(
                 map_type,
                 max_entries.get(name.as_str()).copied(),
@@ -810,7 +823,19 @@ fn parse_map(
     allow_unsupported_maps: bool,
 ) -> Result<(String, Map), EbpfError> {
     let (name, map) = data;
-    let map_type = bpf_map_type::try_from(map.obj().map_type()).map_err(MapError::from)?;
+    let raw_map_type = map.obj().map_type();
+    let map_type = match bpf_map_type::try_from(raw_map_type) {
+        Ok(t) => t,
+        Err(_) if allow_unsupported_maps => {
+            // Unknown map type but unsupported maps are allowed — wrap as Unsupported
+            log::debug!(
+                "skipping map '{}' with unknown type {} (allow_unsupported_maps=true)",
+                name, raw_map_type,
+            );
+            return Ok((name, Map::Unsupported(map)));
+        }
+        Err(e) => return Err(MapError::from(e).into()),
+    };
     let map = match map_type {
         bpf_map_type::BPF_MAP_TYPE_ARRAY => Map::Array(map),
         bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY => Map::PerCpuArray(map),
