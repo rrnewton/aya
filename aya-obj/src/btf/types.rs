@@ -1575,6 +1575,17 @@ pub(crate) fn fields_are_compatible(
             return Ok(true);
         }
 
+        // Int and Ptr are compatible for CO-RE field offset relocations.
+        // The aya CO-RE postprocessor generates __u64 (Int) for pointer fields;
+        // the kernel BTF has Ptr. Both are 8-byte values on 64-bit and only
+        // the byte offset matters for FieldByteOffset relocations.
+        if matches!(
+            (local_ty.kind(), target_ty.kind()),
+            (BtfKind::Int, BtfKind::Ptr) | (BtfKind::Ptr, BtfKind::Int)
+        ) {
+            return Ok(true);
+        }
+
         if !local_ty.is_compatible(target_ty) {
             return Ok(false);
         }
