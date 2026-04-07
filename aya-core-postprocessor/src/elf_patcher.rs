@@ -128,7 +128,7 @@ pub fn patch_elf_sections(
     let mut new_offsets: Vec<NewSection> = Vec::with_capacity(total_sections);
 
     for (i, sec) in sections.iter().enumerate() {
-        let _name = section_name(sec);
+        let name = section_name(sec);
 
         // SHT_NULL (index 0) has no data.
         if sec.sh_type == 0 {
@@ -171,6 +171,29 @@ pub fn patch_elf_sections(
                 original_index: i,
                 new_offset: offset,
                 new_size: new_btf_ext.len(),
+            });
+        } else if name == ".rel.BTF.ext" {
+            // CRITICAL: When we replace .BTF.ext, the old ELF relocations
+            // in .rel.BTF.ext become stale — they reference offsets in the
+            // old .BTF.ext layout. Applying these to the new .BTF.ext would
+            // corrupt type_ids and access strings, causing "field relocation
+            // on a type that doesn't have fields" errors at load time.
+            //
+            // Zero out the relocation section to prevent corruption.
+            // Our new .BTF.ext data doesn't need ELF relocations because
+            // all offsets are resolved by the postprocessor.
+            new_offsets.push(NewSection {
+                original_index: i,
+                new_offset: offset,
+                new_size: 0,
+            });
+        } else if name == ".rel.BTF" {
+            // Same issue: .rel.BTF relocations reference the old .BTF
+            // layout. Zero them out since our new BTF is self-contained.
+            new_offsets.push(NewSection {
+                original_index: i,
+                new_offset: offset,
+                new_size: 0,
             });
         } else if i == e_shstrndx && needs_new_btf_ext {
             // Extended shstrtab with the new ".BTF.ext" name.
