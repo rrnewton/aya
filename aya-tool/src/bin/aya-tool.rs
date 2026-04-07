@@ -1,4 +1,5 @@
 #![expect(unused_crate_dependencies, reason = "used in lib")]
+#![expect(clippy::self_named_module_files, reason = "binary entry point, not a module")]
 
 use std::path::PathBuf;
 

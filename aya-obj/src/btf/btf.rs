@@ -569,15 +569,14 @@ impl Btf {
                 let fwd_name_offset = fwd.name_offset;
                 let fwd_name = self.string_at(fwd_name_offset).unwrap_or_default().into_owned();
                 debug!(
-                    "fixup_kptr_types: replacing FWD '{}' (type {}) with empty STRUCT for kptr chain",
-                    fwd_name, target_type_id
+                    "fixup_kptr_types: replacing FWD '{fwd_name}' (type {target_type_id}) with empty STRUCT for kptr chain"
                 );
-                let struct_id = self.add_type(BtfType::Struct(Struct::new(
+                
+                self.add_type(BtfType::Struct(Struct::new(
                     fwd_name_offset,
                     Vec::new(),
                     0,
-                )));
-                struct_id
+                )))
             } else {
                 target_type_id
             };
@@ -600,8 +599,7 @@ impl Btf {
                 for &(kptr_struct_id, new_ptr_id) in &replacements {
                     if var.btf_type == kptr_struct_id {
                         debug!(
-                            "fixup_kptr_types: rewriting VAR type from Kptr struct {} to PTR -> TYPE_TAG chain {}",
-                            kptr_struct_id, new_ptr_id
+                            "fixup_kptr_types: rewriting VAR type from Kptr struct {kptr_struct_id} to PTR -> TYPE_TAG chain {new_ptr_id}"
                         );
                         var.btf_type = new_ptr_id;
                         break;

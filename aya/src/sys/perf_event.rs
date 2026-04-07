@@ -67,10 +67,6 @@ pub(crate) fn perf_event_open(
                     u64::from(length.into_primitive()),
                 ),
                 BreakpointConfig::Instruction { address } => {
-                    #[expect(
-                        clippy::panic,
-                        reason = "unsupported c_long size indicates an unsupported platform"
-                    )]
                     const fn length(size: usize) -> c_uint {
                         match size {
                             1 => HW_BREAKPOINT_LEN_1,

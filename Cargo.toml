@@ -318,7 +318,6 @@ use_debug = "warn"
 use_self = "warn"
 useless_let_if_seq = "warn"
 verbose_file_reads = "warn"
-volatile_composites = "warn"
 while_float = "warn"
 # wildcard_enum_match_arm = "warn" # Maybe someday.
 
