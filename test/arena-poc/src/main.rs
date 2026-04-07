@@ -27,7 +27,9 @@
 //! linked list from arena memory.
 
 use aya_arena_common::{
-    ArenaListHead, ArenaNodeHeader, ArenaPtr, CounterNode, LabelNode, TAG_COUNTER, TAG_LABEL,
+    ArenaHashEntry, ArenaHashMap, ArenaListHead, ArenaNodeHeader, ArenaPtr, CounterNode, LabelNode,
+    arena_hash_delete, arena_hash_for_each, arena_hash_get, arena_hash_init, arena_hash_insert,
+    TAG_COUNTER, TAG_LABEL,
 };
 
 /// Traverse an arena linked list from userspace, printing each node.
@@ -328,9 +330,83 @@ fn try_live_load() {
     }
 }
 
+/// Demonstrate arena hash map operations in process memory.
+fn simulate_arena_hash_map() {
+    println!("=== Arena hash map demo (no kernel required) ===\n");
+
+    // Allocate a buffer to simulate arena memory
+    let capacity: u32 = 16;
+    let header_size = size_of::<ArenaHashMap>();
+    let entry_size = size_of::<ArenaHashEntry>();
+    let total = header_size + entry_size * capacity as usize;
+    let mut arena = vec![0u8; total];
+    let base = arena.as_mut_ptr();
+    let map = base.cast::<ArenaHashMap>();
+    let entries = unsafe { base.add(header_size) }.cast::<ArenaHashEntry>();
+
+    // Initialize
+    unsafe { arena_hash_init(map, entries, capacity, base) };
+    println!("Initialized hash map: capacity={capacity}, entry_size={entry_size}B, total={total}B");
+
+    // Simulate sched_ext-style mappings: task_id → cell_id
+    println!("\nInserting task→cell mappings:");
+    let mappings: &[(u64, u64)] = &[
+        (1001, 0), // task 1001 → cell 0
+        (1002, 1), // task 1002 → cell 1
+        (1003, 0), // task 1003 → cell 0
+        (1004, 2), // task 1004 → cell 2
+        (1005, 1), // task 1005 → cell 1
+    ];
+
+    for &(task_id, cell_id) in mappings {
+        let ret = unsafe { arena_hash_insert(map, task_id, cell_id, base) };
+        let status = if ret == 0 { "inserted" } else { "updated" };
+        println!("  task {task_id} → cell {cell_id} ({status})");
+    }
+    println!("  Count: {}", unsafe { (*map).count });
+
+    // Lookups
+    println!("\nLookup results:");
+    for task_id in [1001, 1003, 1005, 9999] {
+        let val = unsafe { arena_hash_get(map, task_id, base) };
+        if val.is_null() {
+            println!("  task {task_id}: not found");
+        } else {
+            println!("  task {task_id}: cell {}", unsafe { *val });
+        }
+    }
+
+    // Update
+    println!("\nUpdate task 1002 → cell 3:");
+    let ret = unsafe { arena_hash_insert(map, 1002, 3, base) };
+    println!("  result: {} (1=updated)", ret);
+    println!("  verify: cell {}", unsafe { *arena_hash_get(map, 1002, base) });
+
+    // Delete
+    println!("\nDelete task 1004:");
+    let ret = unsafe { arena_hash_delete(map, 1004, base) };
+    println!("  result: {} (0=deleted)", ret);
+    let val = unsafe { arena_hash_get(map, 1004, base) };
+    println!("  verify: {}", if val.is_null() { "not found (correct)" } else { "STILL FOUND (bug!)" });
+    println!("  Count: {}", unsafe { (*map).count });
+
+    // Iterate all entries
+    println!("\nAll entries (via for_each):");
+    unsafe {
+        arena_hash_for_each(map, base, |k, v| {
+            println!("  task {k} → cell {v}");
+        });
+    }
+}
+
 fn main() {
     // Always works: simulate the arena data structure in process memory
     simulate_arena_traversal();
+
+    println!("\n{}\n", "=".repeat(60));
+
+    // Arena hash map demo
+    simulate_arena_hash_map();
 
     println!("\n{}\n", "=".repeat(60));
 
