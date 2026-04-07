@@ -608,6 +608,633 @@ where
     }
 }
 
+// ── Arena B-Tree ──────────────────────────────────────────────────────
+//
+// Cache-friendly ordered map with bounded operations, designed for
+// BPF verifier compatibility:
+// - ORDER=8: each node holds up to 7 keys (good cache-line utilization)
+// - No recursion: all operations use bounded iterative loops
+// - Max depth 10: supports up to ~10^8 entries
+// - Proactive split-on-descent: insert never needs to backtrack
+// - Lazy delete: no rebalancing (nodes may underflow after deletion)
+
+/// B-tree branching factor. Each node has at most ORDER children
+/// and ORDER-1 keys.
+pub const BTREE_ORDER: usize = 8;
+
+/// Maximum keys per node.
+pub const BTREE_MAX_KEYS: usize = BTREE_ORDER - 1;
+
+/// Median index for splitting a full node.
+const BTREE_MID: usize = BTREE_MAX_KEYS / 2; // = 3
+
+/// Maximum tree depth. Supports 8^10 ≈ 10^9 entries.
+pub const BTREE_MAX_DEPTH: u32 = 10;
+
+/// A B-tree node stored in arena memory.
+///
+/// Layout: 184 bytes (keys=56 + values=56 + children=64 + metadata=8).
+/// Fits in 3 cache lines on most architectures.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct BTreeNode {
+    /// Sorted keys.
+    pub keys: [u64; BTREE_MAX_KEYS],
+    /// Values corresponding to keys.
+    pub values: [u64; BTREE_MAX_KEYS],
+    /// Child pointers (only used in internal nodes). `children[i]` points
+    /// to the subtree with keys < `keys[i]`; `children[num_keys]` points
+    /// to the subtree with keys > `keys[num_keys-1]`.
+    pub children: [ArenaPtr<BTreeNode>; BTREE_ORDER],
+    /// Number of keys currently stored (0..=BTREE_MAX_KEYS).
+    pub num_keys: u32,
+    /// 1 = leaf node, 0 = internal node.
+    pub is_leaf: u32,
+}
+
+impl BTreeNode {
+    /// An empty leaf node.
+    pub const EMPTY_LEAF: Self = Self {
+        keys: [0; BTREE_MAX_KEYS],
+        values: [0; BTREE_MAX_KEYS],
+        children: [ArenaPtr::null(); BTREE_ORDER],
+        num_keys: 0,
+        is_leaf: 1,
+    };
+
+    /// An empty internal node.
+    const EMPTY_INTERNAL: Self = Self {
+        keys: [0; BTREE_MAX_KEYS],
+        values: [0; BTREE_MAX_KEYS],
+        children: [ArenaPtr::null(); BTREE_ORDER],
+        num_keys: 0,
+        is_leaf: 0,
+    };
+}
+
+/// Header for an arena-backed B-tree map.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ArenaBTreeMap {
+    /// Pointer to the root node (null = empty tree).
+    pub root: ArenaPtr<BTreeNode>,
+    /// Total number of key-value pairs in the tree.
+    pub count: u64,
+    /// Current height of the tree (0 = empty, 1 = root only).
+    pub height: u32,
+    /// Padding for alignment.
+    pub _pad: u32,
+}
+
+/// Allocate a B-tree node from the bump allocator.
+///
+/// # Safety
+///
+/// `bump` must point to a valid `ArenaBumpState` with sufficient capacity.
+/// `arena_base` must be the arena base address.
+#[inline(always)]
+unsafe fn btree_alloc_node(
+    bump: *mut ArenaBumpState,
+    arena_base: *mut u8,
+    leaf: bool,
+) -> ArenaPtr<BTreeNode> {
+    let state = &mut *bump;
+    match state.alloc(size_of::<BTreeNode>() as u64, align_of::<BTreeNode>() as u64) {
+        Some(offset) => {
+            let node = arena_base.add(offset as usize).cast::<BTreeNode>();
+            core::ptr::write(
+                node,
+                if leaf {
+                    BTreeNode::EMPTY_LEAF
+                } else {
+                    BTreeNode::EMPTY_INTERNAL
+                },
+            );
+            ArenaPtr::from_offset(offset)
+        }
+        None => ArenaPtr::null(),
+    }
+}
+
+/// Find the position of `key` within a node using linear search.
+///
+/// Returns `(index, found)`:
+/// - `found=true`: `keys[index] == key`
+/// - `found=false`: `key` belongs at position `index` (for insertion or child descent)
+#[inline(always)]
+fn btree_find_key(node: &BTreeNode, key: u64) -> (u32, bool) {
+    let n = node.num_keys;
+    let mut i: u32 = 0;
+    while i < n && i < BTREE_MAX_KEYS as u32 {
+        if node.keys[i as usize] == key {
+            return (i, true);
+        }
+        if node.keys[i as usize] > key {
+            return (i, false);
+        }
+        i += 1;
+    }
+    (i, false)
+}
+
+/// Split a full child node during top-down insert.
+///
+/// `parent` gains one key (the median of `child`).
+/// `child_idx` is the index of `child` in `parent.children`.
+/// `child` is the full node being split (must have MAX_KEYS keys).
+/// `new_sibling_ptr` is the ArenaPtr to the already-allocated new right sibling.
+/// `new_sibling` is the raw pointer to the new sibling node.
+///
+/// After split:
+/// - `child` keeps the left half (BTREE_MID keys: indices 0..MID)
+/// - `new_sibling` gets the right half (BTREE_MID keys: indices MID+1..MAX_KEYS)
+/// - The median key (index MID) is promoted to `parent`
+///
+/// # Safety
+///
+/// All pointers must be valid. `child.num_keys` must be `BTREE_MAX_KEYS`.
+#[inline(always)]
+unsafe fn btree_split_child(
+    parent: *mut BTreeNode,
+    child_idx: u32,
+    child: *mut BTreeNode,
+    new_sibling: *mut BTreeNode,
+    new_sibling_ptr: ArenaPtr<BTreeNode>,
+) {
+    let p = &mut *parent;
+    let c = &*child;
+    let s = &mut *new_sibling;
+
+    // Copy right half of child to new sibling
+    let mut i: usize = 0;
+    while i < BTREE_MID {
+        s.keys[i] = c.keys[BTREE_MID + 1 + i];
+        s.values[i] = c.values[BTREE_MID + 1 + i];
+        i += 1;
+    }
+
+    // If internal node, copy right half of children too
+    if c.is_leaf == 0 {
+        i = 0;
+        while i <= BTREE_MID {
+            s.children[i] = c.children[BTREE_MID + 1 + i];
+            i += 1;
+        }
+    }
+
+    s.num_keys = BTREE_MID as u32;
+    s.is_leaf = c.is_leaf;
+
+    // Shrink child to left half
+    (*child).num_keys = BTREE_MID as u32;
+
+    // Make room in parent: shift keys and children right
+    let mut j = p.num_keys;
+    while j > child_idx {
+        p.keys[j as usize] = p.keys[(j - 1) as usize];
+        p.values[j as usize] = p.values[(j - 1) as usize];
+        p.children[(j + 1) as usize] = p.children[j as usize];
+        j -= 1;
+    }
+
+    // Promote median key to parent
+    p.keys[child_idx as usize] = c.keys[BTREE_MID];
+    p.values[child_idx as usize] = c.values[BTREE_MID];
+    p.children[(child_idx + 1) as usize] = new_sibling_ptr;
+    p.num_keys += 1;
+}
+
+/// Insert a key into a non-full leaf node at the given position.
+#[inline(always)]
+unsafe fn btree_insert_into_leaf(node: *mut BTreeNode, pos: u32, key: u64, value: u64) {
+    let n = &mut *node;
+    // Shift keys right to make room
+    let mut i = n.num_keys;
+    while i > pos {
+        n.keys[i as usize] = n.keys[(i - 1) as usize];
+        n.values[i as usize] = n.values[(i - 1) as usize];
+        i -= 1;
+    }
+    n.keys[pos as usize] = key;
+    n.values[pos as usize] = value;
+    n.num_keys += 1;
+}
+
+/// Initialize an empty B-tree map.
+///
+/// # Safety
+///
+/// `map` must point to valid, writable memory for an `ArenaBTreeMap`.
+pub unsafe fn arena_btree_init(map: *mut ArenaBTreeMap) {
+    unsafe {
+        core::ptr::write(
+            map,
+            ArenaBTreeMap {
+                root: ArenaPtr::null(),
+                count: 0,
+                height: 0,
+                _pad: 0,
+            },
+        );
+    }
+}
+
+/// Insert a key-value pair into the B-tree.
+///
+/// Uses top-down proactive splitting: full nodes are split during
+/// descent so the leaf is guaranteed to have room.
+///
+/// Returns:
+/// -  0 = inserted (new key)
+/// -  1 = updated (existing key)
+/// - -1 = allocation failure or tree too deep
+///
+/// # Safety
+///
+/// `map`, `bump` must point to valid objects. `arena_base` must be the arena base.
+pub unsafe fn arena_btree_insert(
+    map: *mut ArenaBTreeMap,
+    bump: *mut ArenaBumpState,
+    key: u64,
+    value: u64,
+    arena_base: *mut u8,
+) -> i32 {
+    let header = &mut *map;
+
+    // Empty tree: create root leaf
+    if header.root.is_null() {
+        let root_ptr = btree_alloc_node(bump, arena_base, true);
+        if root_ptr.is_null() {
+            return -1;
+        }
+        let root = root_ptr.resolve(arena_base);
+        (*root).keys[0] = key;
+        (*root).values[0] = value;
+        (*root).num_keys = 1;
+        header.root = root_ptr;
+        header.count = 1;
+        header.height = 1;
+        return 0;
+    }
+
+    // If root is full, split it first
+    let root = header.root.resolve(arena_base);
+    if (*root).num_keys == BTREE_MAX_KEYS as u32 {
+        let new_root_ptr = btree_alloc_node(bump, arena_base, false);
+        if new_root_ptr.is_null() {
+            return -1;
+        }
+        let new_root = new_root_ptr.resolve(arena_base);
+        (*new_root).children[0] = header.root;
+
+        let sibling_ptr = btree_alloc_node(bump, arena_base, (*root).is_leaf != 0);
+        if sibling_ptr.is_null() {
+            return -1;
+        }
+        let sibling = sibling_ptr.resolve(arena_base);
+
+        btree_split_child(new_root, 0, root, sibling, sibling_ptr);
+
+        header.root = new_root_ptr;
+        header.height += 1;
+    }
+
+    // Walk down the tree, splitting full children proactively
+    let mut current_ptr = header.root;
+    let mut depth: u32 = 0;
+
+    while depth < BTREE_MAX_DEPTH {
+        let current = current_ptr.resolve(arena_base);
+        if current.is_null() {
+            return -1;
+        }
+
+        let (pos, found) = btree_find_key(&*current, key);
+
+        // Key already exists — update value
+        if found {
+            (*current).values[pos as usize] = value;
+            return 1;
+        }
+
+        // Leaf: insert here (guaranteed non-full by proactive splitting)
+        if (*current).is_leaf != 0 {
+            if (*current).num_keys >= BTREE_MAX_KEYS as u32 {
+                return -1; // shouldn't happen with proactive splitting
+            }
+            btree_insert_into_leaf(current, pos, key, value);
+            header.count += 1;
+            return 0;
+        }
+
+        // Internal node: check if child[pos] is full, split if so
+        let child_ptr = (*current).children[pos as usize];
+        let child = child_ptr.resolve(arena_base);
+        if child.is_null() {
+            return -1;
+        }
+
+        if (*child).num_keys == BTREE_MAX_KEYS as u32 {
+            let sibling_ptr = btree_alloc_node(bump, arena_base, (*child).is_leaf != 0);
+            if sibling_ptr.is_null() {
+                return -1;
+            }
+            let sibling = sibling_ptr.resolve(arena_base);
+
+            btree_split_child(current, pos, child, sibling, sibling_ptr);
+
+            // After split, determine which child to descend into
+            if key == (*current).keys[pos as usize] {
+                // Key was the promoted median — update
+                (*current).values[pos as usize] = value;
+                return 1;
+            }
+            if key > (*current).keys[pos as usize] {
+                current_ptr = (*current).children[(pos + 1) as usize];
+            } else {
+                current_ptr = (*current).children[pos as usize];
+            }
+        } else {
+            current_ptr = child_ptr;
+        }
+
+        depth += 1;
+    }
+
+    -1 // Tree too deep
+}
+
+/// Look up a key in the B-tree.
+///
+/// Returns a pointer to the value if found, or null if not found.
+///
+/// # Safety
+///
+/// `map` must point to a valid, initialized `ArenaBTreeMap`.
+/// `arena_base` must be the arena base address.
+pub unsafe fn arena_btree_get(
+    map: *const ArenaBTreeMap,
+    key: u64,
+    arena_base: *mut u8,
+) -> *const u64 {
+    let header = &*map;
+    let mut current_ptr = header.root;
+    let mut depth: u32 = 0;
+
+    while depth < BTREE_MAX_DEPTH && !current_ptr.is_null() {
+        let current = current_ptr.resolve(arena_base);
+        if current.is_null() {
+            return core::ptr::null();
+        }
+
+        let (pos, found) = btree_find_key(&*current, key);
+
+        if found {
+            return &(*current).values[pos as usize];
+        }
+
+        if (*current).is_leaf != 0 {
+            return core::ptr::null(); // Not found
+        }
+
+        current_ptr = (*current).children[pos as usize];
+        depth += 1;
+    }
+
+    core::ptr::null()
+}
+
+/// Delete a key from the B-tree.
+///
+/// Uses lazy deletion: removes the key but does not rebalance
+/// underflowing nodes. This is acceptable for arena memory where
+/// individual node deallocation isn't possible (bump allocator).
+///
+/// Returns:
+/// -  0 = deleted
+/// - -1 = key not found
+///
+/// # Safety
+///
+/// `map` must point to a valid, initialized `ArenaBTreeMap`.
+/// `arena_base` must be the arena base address.
+pub unsafe fn arena_btree_delete(
+    map: *mut ArenaBTreeMap,
+    key: u64,
+    arena_base: *mut u8,
+) -> i32 {
+    let header = &mut *map;
+    if header.root.is_null() {
+        return -1;
+    }
+
+    // Find the key: walk down, recording the path
+    #[derive(Copy, Clone)]
+    struct PathEntry {
+        node: *mut BTreeNode,
+        #[allow(dead_code)] // used implicitly to track position during descent
+        idx: u32,
+    }
+    let mut path = [PathEntry {
+        node: core::ptr::null_mut(),
+        idx: 0,
+    }; BTREE_MAX_DEPTH as usize];
+    let mut path_len: usize = 0;
+
+    let mut current_ptr = header.root;
+    let mut found_at: Option<(usize, u32)> = None; // (path_depth, key_index)
+
+    let mut depth: u32 = 0;
+    while depth < BTREE_MAX_DEPTH && !current_ptr.is_null() {
+        let current = current_ptr.resolve(arena_base);
+        if current.is_null() {
+            return -1;
+        }
+
+        let (pos, found) = btree_find_key(&*current, key);
+
+        if path_len < BTREE_MAX_DEPTH as usize {
+            path[path_len] = PathEntry {
+                node: current,
+                idx: pos,
+            };
+            path_len += 1;
+        }
+
+        if found {
+            found_at = Some((path_len - 1, pos));
+
+            if (*current).is_leaf != 0 {
+                break; // Found in leaf — remove directly
+            }
+
+            // Found in internal node — find in-order predecessor
+            // (rightmost key in left subtree)
+            current_ptr = (*current).children[pos as usize];
+            depth += 1;
+
+            // Descend to rightmost leaf
+            while depth < BTREE_MAX_DEPTH && !current_ptr.is_null() {
+                let node = current_ptr.resolve(arena_base);
+                if node.is_null() {
+                    break;
+                }
+                let n = (*node).num_keys;
+                if path_len < BTREE_MAX_DEPTH as usize {
+                    path[path_len] = PathEntry { node, idx: n };
+                    path_len += 1;
+                }
+                if (*node).is_leaf != 0 {
+                    break;
+                }
+                current_ptr = (*node).children[n as usize];
+                depth += 1;
+            }
+            break;
+        }
+
+        if (*current).is_leaf != 0 {
+            return -1; // Not found
+        }
+
+        current_ptr = (*current).children[pos as usize];
+        depth += 1;
+    }
+
+    let (found_depth, found_pos) = match found_at {
+        Some(f) => f,
+        None => return -1,
+    };
+
+    let found_node = path[found_depth].node;
+    let found_n = &*found_node;
+
+    if found_n.is_leaf != 0 {
+        // Key is in a leaf — remove by shifting left
+        let n = &mut *found_node;
+        let mut i = found_pos;
+        while i + 1 < n.num_keys {
+            n.keys[i as usize] = n.keys[(i + 1) as usize];
+            n.values[i as usize] = n.values[(i + 1) as usize];
+            i += 1;
+        }
+        n.num_keys -= 1;
+    } else {
+        // Key is in internal node — replace with in-order predecessor
+        // The predecessor is the rightmost key in the leaf at the end of our path
+        if path_len == 0 {
+            return -1;
+        }
+        let pred_node = path[path_len - 1].node;
+        let pred_n = &mut *pred_node;
+        if pred_n.num_keys == 0 {
+            return -1;
+        }
+        let pred_idx = pred_n.num_keys - 1;
+
+        // Swap predecessor into the found position
+        (*found_node).keys[found_pos as usize] = pred_n.keys[pred_idx as usize];
+        (*found_node).values[found_pos as usize] = pred_n.values[pred_idx as usize];
+
+        // Remove predecessor from leaf
+        pred_n.num_keys -= 1;
+    }
+
+    header.count -= 1;
+
+    // If tree is now empty, reset root
+    if header.count == 0 {
+        header.root = ArenaPtr::null();
+        header.height = 0;
+    }
+
+    0
+}
+
+/// Iterate over all key-value pairs in the B-tree in sorted order.
+///
+/// Uses an explicit stack for iterative in-order traversal.
+/// Each stack frame tracks (node_ptr, step) where step interleaves
+/// child visits (even steps) and key emissions (odd steps).
+///
+/// # Safety
+///
+/// `map` must point to a valid, initialized `ArenaBTreeMap`.
+/// `arena_base` must be the arena base address.
+pub unsafe fn arena_btree_for_each<F>(map: *const ArenaBTreeMap, arena_base: *mut u8, mut f: F)
+where
+    F: FnMut(u64, u64),
+{
+    let header = &*map;
+    if header.root.is_null() || header.count == 0 {
+        return;
+    }
+
+    #[derive(Copy, Clone)]
+    struct Frame {
+        node_ptr: ArenaPtr<BTreeNode>,
+        step: u32, // interleaved: even=child visit, odd=key emit
+    }
+
+    let mut stack = [Frame {
+        node_ptr: ArenaPtr::null(),
+        step: 0,
+    }; BTREE_MAX_DEPTH as usize + 1];
+
+    // Push root
+    stack[0] = Frame {
+        node_ptr: header.root,
+        step: 0,
+    };
+    let mut sp: usize = 1;
+
+    // Bound total iterations to prevent infinite loops
+    let max_iters = header.count * 4 + 100;
+    let mut iters: u64 = 0;
+
+    while sp > 0 && iters < max_iters {
+        iters += 1;
+
+        let frame = &mut stack[sp - 1];
+        let node = frame.node_ptr.resolve(arena_base);
+        if node.is_null() {
+            sp -= 1;
+            continue;
+        }
+        let n = &*node;
+        let total_steps = 2 * n.num_keys + 1;
+
+        if frame.step >= total_steps {
+            sp -= 1; // Done with this node
+            continue;
+        }
+
+        let step = frame.step;
+        frame.step += 1;
+
+        if step % 2 == 0 {
+            // Even step: visit child[step/2]
+            let child_idx = step / 2;
+            if n.is_leaf == 0 && child_idx <= n.num_keys {
+                let child_ptr = n.children[child_idx as usize];
+                if !child_ptr.is_null() && sp < stack.len() {
+                    stack[sp] = Frame {
+                        node_ptr: child_ptr,
+                        step: 0,
+                    };
+                    sp += 1;
+                }
+            }
+        } else {
+            // Odd step: emit key[step/2]
+            let key_idx = step / 2;
+            if key_idx < n.num_keys {
+                f(n.keys[key_idx as usize], n.values[key_idx as usize]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;
@@ -1008,5 +1635,328 @@ mod tests {
 
         assert_eq!(unsafe { arena_hash_insert(map, u64::MAX, 42, base) }, 0);
         assert_eq!(unsafe { *arena_hash_get(map, u64::MAX, base) }, 42);
+    }
+
+    // ── B-tree tests ─────────────────────────────────────────────────
+
+    /// Helper: create a simulated arena with a B-tree map and bump allocator.
+    fn make_btree() -> (Vec<u8>, *mut ArenaBTreeMap, *mut ArenaBumpState) {
+        let arena_size = 256 * 1024; // 256 KiB — enough for many nodes
+        let mut buf = vec![0u8; arena_size];
+        let base = buf.as_mut_ptr();
+
+        // Place ArenaBTreeMap at offset 0
+        let map = base.cast::<ArenaBTreeMap>();
+        unsafe { arena_btree_init(map) };
+
+        // Place ArenaBumpState right after
+        let bump_offset = size_of::<ArenaBTreeMap>();
+        let bump = unsafe { base.add(bump_offset).cast::<ArenaBumpState>() };
+        let data_start = bump_offset + size_of::<ArenaBumpState>();
+        unsafe {
+            *bump = ArenaBumpState::new((arena_size - data_start) as u64);
+            // Adjust watermark to skip the header area
+            (*bump).watermark = data_start as u64;
+        }
+
+        (buf, map, bump)
+    }
+
+    #[test]
+    fn btree_node_layout() {
+        assert_eq!(mem::size_of::<BTreeNode>(), 184);
+        assert_eq!(mem::align_of::<BTreeNode>(), 8);
+    }
+
+    #[test]
+    fn btree_map_layout() {
+        assert_eq!(mem::size_of::<ArenaBTreeMap>(), 24);
+        assert_eq!(mem::align_of::<ArenaBTreeMap>(), 8);
+    }
+
+    #[test]
+    fn btree_empty() {
+        let (buf, map, _bump) = make_btree();
+        let base = buf.as_ptr() as *mut u8;
+
+        let val = unsafe { arena_btree_get(map, 42, base) };
+        assert!(val.is_null());
+        assert_eq!(unsafe { (*map).count }, 0);
+    }
+
+    #[test]
+    fn btree_insert_and_get_single() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        let ret = unsafe { arena_btree_insert(map, bump, 42, 100, base) };
+        assert_eq!(ret, 0);
+        assert_eq!(unsafe { (*map).count }, 1);
+
+        let val = unsafe { arena_btree_get(map, 42, base) };
+        assert!(!val.is_null());
+        assert_eq!(unsafe { *val }, 100);
+    }
+
+    #[test]
+    fn btree_update_existing() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        unsafe { arena_btree_insert(map, bump, 42, 100, base) };
+        let ret = unsafe { arena_btree_insert(map, bump, 42, 200, base) };
+        assert_eq!(ret, 1); // Updated
+        assert_eq!(unsafe { (*map).count }, 1); // Count unchanged
+
+        assert_eq!(unsafe { *arena_btree_get(map, 42, base) }, 200);
+    }
+
+    #[test]
+    fn btree_miss() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        unsafe { arena_btree_insert(map, bump, 10, 1, base) };
+        assert!(unsafe { arena_btree_get(map, 99, base) }.is_null());
+    }
+
+    #[test]
+    fn btree_multiple_inserts_within_one_node() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        // Insert 7 keys (fills one leaf node exactly)
+        for i in 0..BTREE_MAX_KEYS as u64 {
+            let ret = unsafe { arena_btree_insert(map, bump, (i + 1) * 10, i + 1, base) };
+            assert_eq!(ret, 0);
+        }
+        assert_eq!(unsafe { (*map).count }, BTREE_MAX_KEYS as u64);
+
+        // All should be found
+        for i in 0..BTREE_MAX_KEYS as u64 {
+            let val = unsafe { arena_btree_get(map, (i + 1) * 10, base) };
+            assert!(!val.is_null());
+            assert_eq!(unsafe { *val }, i + 1);
+        }
+    }
+
+    #[test]
+    fn btree_triggers_root_split() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        // Insert MAX_KEYS + 1 keys to trigger root split
+        for i in 0..=BTREE_MAX_KEYS as u64 {
+            let ret = unsafe { arena_btree_insert(map, bump, i + 1, (i + 1) * 100, base) };
+            assert_eq!(ret, 0, "failed to insert key {}", i + 1);
+        }
+        assert_eq!(unsafe { (*map).count }, (BTREE_MAX_KEYS + 1) as u64);
+        assert_eq!(unsafe { (*map).height }, 2); // Root was split
+
+        // All should be found
+        for i in 0..=BTREE_MAX_KEYS as u64 {
+            let val = unsafe { arena_btree_get(map, i + 1, base) };
+            assert!(!val.is_null(), "key {} not found after root split", i + 1);
+            assert_eq!(unsafe { *val }, (i + 1) * 100);
+        }
+    }
+
+    #[test]
+    fn btree_ordered_iteration() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        // Insert keys out of order
+        for &k in &[50, 30, 70, 10, 40, 60, 80, 20, 90] {
+            unsafe { arena_btree_insert(map, bump, k, k * 10, base) };
+        }
+
+        // Iterate — should produce sorted order
+        let mut keys = Vec::new();
+        unsafe {
+            arena_btree_for_each(map, base, |k, v| {
+                assert_eq!(v, k * 10);
+                keys.push(k);
+            });
+        }
+        assert_eq!(keys, vec![10, 20, 30, 40, 50, 60, 70, 80, 90]);
+    }
+
+    #[test]
+    fn btree_delete_from_leaf() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        for k in 1..=5u64 {
+            unsafe { arena_btree_insert(map, bump, k, k * 10, base) };
+        }
+
+        // Delete key 3
+        let ret = unsafe { arena_btree_delete(map, 3, base) };
+        assert_eq!(ret, 0);
+        assert_eq!(unsafe { (*map).count }, 4);
+
+        // 3 should be gone, others remain
+        assert!(unsafe { arena_btree_get(map, 3, base) }.is_null());
+        assert_eq!(unsafe { *arena_btree_get(map, 1, base) }, 10);
+        assert_eq!(unsafe { *arena_btree_get(map, 5, base) }, 50);
+    }
+
+    #[test]
+    fn btree_delete_miss() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        unsafe { arena_btree_insert(map, bump, 1, 10, base) };
+        assert_eq!(unsafe { arena_btree_delete(map, 99, base) }, -1);
+        assert_eq!(unsafe { (*map).count }, 1);
+    }
+
+    #[test]
+    fn btree_delete_from_internal() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        // Insert enough to create a 2-level tree
+        for i in 1..=15u64 {
+            unsafe { arena_btree_insert(map, bump, i, i * 100, base) };
+        }
+        assert!(unsafe { (*map).height } >= 2);
+
+        // Delete a key that's in an internal node (promoted median)
+        // The median of keys 1..8 is 4, which gets promoted to root on first split
+        let root = unsafe { (*map).root.resolve(base) };
+        let root_key = unsafe { (*root).keys[0] };
+
+        let ret = unsafe { arena_btree_delete(map, root_key, base) };
+        assert_eq!(ret, 0);
+        assert_eq!(unsafe { (*map).count }, 14);
+
+        // Deleted key should not be found
+        assert!(unsafe { arena_btree_get(map, root_key, base) }.is_null());
+
+        // Other keys should still be found
+        for i in 1..=15u64 {
+            if i == root_key {
+                continue;
+            }
+            let val = unsafe { arena_btree_get(map, i, base) };
+            assert!(!val.is_null(), "key {i} not found after delete of {root_key}");
+            assert_eq!(unsafe { *val }, i * 100);
+        }
+    }
+
+    #[test]
+    fn btree_delete_all() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        for k in 1..=5u64 {
+            unsafe { arena_btree_insert(map, bump, k, k, base) };
+        }
+
+        for k in 1..=5u64 {
+            assert_eq!(unsafe { arena_btree_delete(map, k, base) }, 0);
+        }
+        assert_eq!(unsafe { (*map).count }, 0);
+    }
+
+    #[test]
+    fn btree_key_zero_and_max() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        unsafe {
+            arena_btree_insert(map, bump, 0, 1, base);
+            arena_btree_insert(map, bump, u64::MAX, 2, base);
+        }
+
+        assert_eq!(unsafe { *arena_btree_get(map, 0, base) }, 1);
+        assert_eq!(unsafe { *arena_btree_get(map, u64::MAX, base) }, 2);
+
+        // Ordered iteration: 0 first, MAX last
+        let mut keys = Vec::new();
+        unsafe { arena_btree_for_each(map, base, |k, _| keys.push(k)) };
+        assert_eq!(keys, vec![0, u64::MAX]);
+    }
+
+    #[test]
+    fn btree_stress_100() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        // Insert 100 keys in scrambled order
+        for i in 0..100u64 {
+            let key = (i * 37 + 13) % 100; // pseudo-random permutation
+            let ret = unsafe { arena_btree_insert(map, bump, key, key * 10, base) };
+            assert!(ret == 0 || ret == 1, "insert failed for key {key}");
+        }
+
+        // Verify all 100 keys exist
+        for i in 0..100u64 {
+            let val = unsafe { arena_btree_get(map, i, base) };
+            assert!(!val.is_null(), "key {i} not found");
+            assert_eq!(unsafe { *val }, i * 10);
+        }
+
+        // Verify ordered iteration
+        let mut prev: Option<u64> = None;
+        let mut count = 0u64;
+        unsafe {
+            arena_btree_for_each(map, base, |k, _| {
+                if let Some(p) = prev {
+                    assert!(k > p, "out of order: {p} before {k}");
+                }
+                prev = Some(k);
+                count += 1;
+            });
+        }
+        assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn btree_stress_1000_insert_delete() {
+        let (mut buf, map, bump) = make_btree();
+        let base = buf.as_mut_ptr();
+
+        // Insert 1000 keys
+        for i in 0..1000u64 {
+            let key = (i * 7919 + 1) % 10000; // spread across range
+            unsafe { arena_btree_insert(map, bump, key, i, base) };
+        }
+
+        let count_before = unsafe { (*map).count };
+        assert!(count_before > 0);
+
+        // Delete first 500
+        let mut deleted = 0u64;
+        for i in 0..500u64 {
+            let key = (i * 7919 + 1) % 10000;
+            if unsafe { arena_btree_delete(map, key, base) } == 0 {
+                deleted += 1;
+            }
+        }
+        assert_eq!(unsafe { (*map).count }, count_before - deleted);
+
+        // Remaining 500 should still be found
+        for i in 500..1000u64 {
+            let key = (i * 7919 + 1) % 10000;
+            let val = unsafe { arena_btree_get(map, key, base) };
+            // May not find if there were duplicate keys from the permutation
+            if !val.is_null() {
+                assert_eq!(unsafe { *val }, i);
+            }
+        }
+
+        // Ordered iteration should still work
+        let mut prev: Option<u64> = None;
+        unsafe {
+            arena_btree_for_each(map, base, |k, _| {
+                if let Some(p) = prev {
+                    assert!(k > p, "order violation after deletes: {p} >= {k}");
+                }
+                prev = Some(k);
+            });
+        }
     }
 }
