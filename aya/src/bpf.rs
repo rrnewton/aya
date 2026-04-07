@@ -777,8 +777,32 @@ impl<'a> EbpfLoader<'a> {
             struct_ops_maps,
             btf_fd,
             kernel_btf: btf.as_deref().cloned(),
+            program_btf: obj.btf,
         })
     }
+}
+
+/// Get the size in bytes of a BTF type, following typedefs/const/volatile modifiers.
+fn btf_type_size(btf: &Btf, type_id: u32) -> Option<usize> {
+    let ty = btf.type_by_id(type_id).ok()?;
+
+    // Direct size types (Int, Struct, Union, Enum, Ptr, etc.)
+    if let Some(size) = ty.size() {
+        return Some(size as usize);
+    }
+
+    // Array: element_size * len
+    if let Some((elem_type, len)) = ty.array_info() {
+        let elem_size = btf_type_size(btf, elem_type)?;
+        return Some(elem_size * len as usize);
+    }
+
+    // Modifier/reference types — follow to the underlying type
+    if let Some(inner_id) = ty.btf_type() {
+        return btf_type_size(btf, inner_id);
+    }
+
+    None
 }
 
 fn parse_map(
@@ -944,6 +968,8 @@ pub struct Ebpf {
     struct_ops_maps: HashMap<String, aya_obj::Map>,
     btf_fd: Option<Arc<crate::MockableFd>>,
     kernel_btf: Option<Btf>,
+    /// The program's own BTF (from the ELF), used for struct_ops field remapping.
+    program_btf: Option<Btf>,
 }
 
 /// The main entry point into the library, used to work with eBPF programs and maps.
@@ -1270,21 +1296,118 @@ impl Ebpf {
             &kernel_btf, members, vmlinux_type_id,
         )?;
 
-        // Build the map value: wrapper-sized buffer with section data at data_offset
+        // Build the map value: wrapper-sized buffer, zero-initialized.
         let mut value = vec![0u8; wrapper_size as usize];
-        let copy_len = section_data.len().min(value.len() - data_offset);
-        value[data_offset..data_offset + copy_len]
-            .copy_from_slice(&section_data[..copy_len]);
 
-        // Write loaded program FDs into function pointer field positions
-        for member in members {
-            let member_name = kernel_btf.string_at(member.name_offset).unwrap_or_default();
-            if let Some(&fd) = prog_fds.get(member_name.as_ref()) {
-                let offset = data_offset + (member.offset / 8) as usize;
-                if let Ok(member_type) = kernel_btf.type_by_id(member.btf_type) {
-                    if matches!(member_type, BtfType::Ptr(_)) && offset + 4 <= value.len() {
-                        value[offset..offset + 4]
-                            .copy_from_slice(&(fd as u32).to_ne_bytes());
+        // BTF-aware field-by-field remapping (like libbpf's bpf_map__init_kern_struct_ops).
+        //
+        // Instead of raw-copying the ELF section data (which assumes identical
+        // struct layout between compile-time and runtime), we:
+        //   1. Iterate ELF BTF struct members
+        //   2. Find each member in kernel BTF by name
+        //   3. Copy data from ELF offset to kernel offset
+        //   4. Write program FDs at kernel offsets (8 bytes, like libbpf)
+        //
+        // This handles struct layout changes between kernel versions (e.g.,
+        // added/removed/reordered fields in sched_ext_ops).
+
+        // Get ELF-side struct members from program BTF
+        let elf_members: Option<Vec<(String, u32, u32)>> = self.program_btf.as_ref().and_then(|pbtf| {
+            let type_id = pbtf.id_by_type_name_kind(&struct_type_name, BtfKind::Struct).ok()?;
+            match pbtf.type_by_id(type_id).ok()? {
+                BtfType::Struct(s) => {
+                    Some(s.members.iter().filter_map(|m| {
+                        let name = pbtf.string_at(m.name_offset).ok()?;
+                        Some((name.to_string(), m.offset / 8, m.btf_type))
+                    }).collect())
+                }
+                _ => None,
+            }
+        });
+
+        if let Some(elf_members) = &elf_members {
+            log::debug!("struct_ops: BTF-aware remapping: {} ELF members -> {} kernel members",
+                     elf_members.len(), members.len());
+            // Field-by-field remapping: ELF offset → kernel offset
+            for (elf_name, elf_byte_offset, elf_btf_type) in elf_members {
+                // Find matching kernel member by name
+                let kern_member = members.iter().find(|m| {
+                    kernel_btf.string_at(m.name_offset)
+                        .map(|n| n == *elf_name)
+                        .unwrap_or(false)
+                });
+
+                let kern_member = match kern_member {
+                    Some(m) => m,
+                    None => {
+                        // ELF has a field the kernel doesn't — skip if zero in section_data
+                        continue;
+                    }
+                };
+
+                let kern_byte_offset = (kern_member.offset / 8) as usize;
+
+                // Check if this is a pointer (callback) or data field
+                let is_ptr = kernel_btf.type_by_id(kern_member.btf_type)
+                    .map(|t| matches!(t, BtfType::Ptr(_)))
+                    .unwrap_or(false);
+
+                if is_ptr {
+                    // Callback field: write program FD if we have one, otherwise skip
+                    // (the buffer is zero-initialized, which means "no callback")
+                    if let Some(&fd) = prog_fds.get(elf_name.as_str()) {
+                        let dst = data_offset + kern_byte_offset;
+                        log::debug!("  callback '{}': elf_off={} kern_off={} fd={} dst={}",
+                                 elf_name, elf_byte_offset, kern_byte_offset, fd, dst);
+                        // Write as u64 (sizeof(unsigned long)) to match libbpf
+                        if dst + 8 <= value.len() {
+                            value[dst..dst + 8]
+                                .copy_from_slice(&(fd as u64).to_ne_bytes());
+                        }
+                    }
+                } else {
+                    // Data field: copy from ELF section_data at ELF offset to
+                    // kernel buffer at kernel offset
+                    let elf_off = *elf_byte_offset as usize;
+
+                    // Determine field size from ELF BTF type
+                    let field_size = self.program_btf.as_ref()
+                        .and_then(|pbtf| btf_type_size(pbtf, *elf_btf_type))
+                        .unwrap_or(0);
+
+                    if field_size > 0
+                        && elf_off + field_size <= section_data.len()
+                        && data_offset + kern_byte_offset + field_size <= value.len()
+                    {
+                        let dst = data_offset + kern_byte_offset;
+                        log::debug!("  data '{}': elf_off={} kern_off={} size={} dst={}",
+                                 elf_name, elf_off, kern_byte_offset, field_size, dst);
+                        value[dst..dst + field_size]
+                            .copy_from_slice(&section_data[elf_off..elf_off + field_size]);
+                    } else {
+                        log::debug!("  data '{}': SKIPPED (field_size={}, elf_off={}, section_data.len()={}, value.len()={})",
+                                 elf_name, field_size, elf_off, section_data.len(), value.len());
+                    }
+                }
+            }
+        } else {
+            // Fallback: no program BTF available — use raw copy (old behavior).
+            // This still works when compile-time and runtime struct layouts match.
+            log::warn!("No program BTF for struct_ops field remapping; using raw copy");
+            let copy_len = section_data.len().min(value.len() - data_offset);
+            value[data_offset..data_offset + copy_len]
+                .copy_from_slice(&section_data[..copy_len]);
+
+            // Write loaded program FDs into function pointer field positions
+            for member in members {
+                let member_name = kernel_btf.string_at(member.name_offset).unwrap_or_default();
+                if let Some(&fd) = prog_fds.get(member_name.as_ref()) {
+                    let offset = data_offset + (member.offset / 8) as usize;
+                    if let Ok(member_type) = kernel_btf.type_by_id(member.btf_type) {
+                        if matches!(member_type, BtfType::Ptr(_)) && offset + 8 <= value.len() {
+                            value[offset..offset + 8]
+                                .copy_from_slice(&(fd as u64).to_ne_bytes());
+                        }
                     }
                 }
             }

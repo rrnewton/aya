@@ -1320,7 +1320,8 @@ impl BtfType {
         }
     }
 
-    pub(crate) const fn size(&self) -> Option<u32> {
+    /// Returns the size of this type in bytes, if it has one.
+    pub const fn size(&self) -> Option<u32> {
         match self {
             Self::Int(t) => Some(t.size),
             Self::Float(t) => Some(t.size),
@@ -1334,7 +1335,8 @@ impl BtfType {
         }
     }
 
-    pub(crate) const fn btf_type(&self) -> Option<u32> {
+    /// Returns the inner type ID for modifier/reference types.
+    pub const fn btf_type(&self) -> Option<u32> {
         match self {
             Self::Const(t) => Some(t.btf_type),
             Self::Volatile(t) => Some(t.btf_type),
@@ -1346,6 +1348,14 @@ impl BtfType {
             Self::Var(t) => Some(t.btf_type),
             Self::DeclTag(t) => Some(t.btf_type),
             Self::TypeTag(t) => Some(t.btf_type),
+            _ => None,
+        }
+    }
+
+    /// Returns (element_type_id, len) for Array types.
+    pub const fn array_info(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Array(a) => Some((a.array.element_type, a.array.len)),
             _ => None,
         }
     }
