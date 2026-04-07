@@ -71,6 +71,7 @@ use crate::{
     util::nr_cpus,
 };
 
+pub mod arena;
 pub mod array;
 pub mod bloom_filter;
 pub mod cgrp_storage;
@@ -86,6 +87,7 @@ pub mod stack;
 pub mod stack_trace;
 pub mod xdp;
 
+pub use arena::Arena;
 pub use array::{Array, PerCpuArray, ProgramArray};
 pub use bloom_filter::BloomFilter;
 pub use cgrp_storage::CgrpStorage;
@@ -236,6 +238,8 @@ impl AsFd for MapFd {
 /// eBPF map types.
 #[derive(Debug)]
 pub enum Map {
+    /// An [`Arena`] map.
+    Arena(MapData),
     /// An [`Array`] map.
     Array(MapData),
     /// A [`BloomFilter`] map.
@@ -288,6 +292,7 @@ impl Map {
     /// Returns the low level map type.
     const fn map_type(&self) -> u32 {
         match self {
+            Self::Arena(map) => map.obj.map_type(),
             Self::Array(map) => map.obj.map_type(),
             Self::BloomFilter(map) => map.obj.map_type(),
             Self::CgrpStorage(map) => map.obj.map_type(),
@@ -320,6 +325,7 @@ impl Map {
     /// is deleted. All parent directories in the given `path` must already exist.
     pub fn pin<P: AsRef<Path>>(&self, path: P) -> Result<(), PinError> {
         match self {
+            Self::Arena(map) => map.pin(path),
             Self::Array(map) => map.pin(path),
             Self::BloomFilter(map) => map.pin(path),
             Self::CgrpStorage(map) => map.pin(path),
@@ -390,7 +396,7 @@ impl Map {
             bpf_map_type::BPF_MAP_TYPE_TASK_STORAGE => Self::Unsupported(map_data),
             bpf_map_type::BPF_MAP_TYPE_USER_RINGBUF => Self::Unsupported(map_data),
             bpf_map_type::BPF_MAP_TYPE_CGRP_STORAGE => Self::CgrpStorage(map_data),
-            bpf_map_type::BPF_MAP_TYPE_ARENA => Self::Unsupported(map_data),
+            bpf_map_type::BPF_MAP_TYPE_ARENA => Self::Arena(map_data),
             bpf_map_type::BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE_DEPRECATED => {
                 Self::Unsupported(map_data)
             }
@@ -428,6 +434,7 @@ macro_rules! impl_map_pin {
 }
 
 impl_map_pin!(() {
+    Arena,
     ProgramArray,
     SockMap,
     StackTraceMap,
@@ -506,6 +513,7 @@ macro_rules! impl_try_from_map {
 }
 
 impl_try_from_map!(() {
+    Arena,
     CpuMap,
     DevMap,
     DevMapHash,

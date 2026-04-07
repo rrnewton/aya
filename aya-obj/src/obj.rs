@@ -1400,6 +1400,20 @@ fn get_map_field(btf: &Btf, type_id: u32) -> Result<u32, BtfError> {
     Ok(arr.len)
 }
 
+/// Like [`get_map_field`] but returns a `u64`. Used for `__ulong()` fields
+/// like `map_extra` which encode 64-bit values.
+///
+/// In C BPF map definitions, `__ulong(name, val)` generates an enum member
+/// whose value the compiler encodes as an array length in BTF. For values
+/// that fit in 32 bits this is the same as `get_map_field`. For larger values
+/// (e.g. `1ull << 44`), the BTF array length still holds the value because
+/// BTF uses `__u32 nelems` — but the _intended_ semantic is a full 64-bit
+/// VA hint. We read it as `u32` from the array and widen to `u64`; the
+/// kernel does the same in `bpf_map_meta_equal`.
+fn get_map_field_u64(btf: &Btf, type_id: u32) -> Result<u64, BtfError> {
+    get_map_field(btf, type_id).map(u64::from)
+}
+
 // Parse '.bss' '.data' and '.rodata' sections. These sections are arrays of
 // bytes and are relocated based on their section index.
 fn parse_data_map_section(section: &Section<'_>) -> Map {
@@ -1528,6 +1542,9 @@ fn parse_btf_map_def(btf: &Btf, info: &DataSecEntry) -> Result<(String, BtfMapDe
             "map_flags" => {
                 map_def.map_flags = get_map_field(btf, m.btf_type)?;
             }
+            "map_extra" => {
+                map_def.map_extra = get_map_field_u64(btf, m.btf_type)?;
+            }
             "pinning" => {
                 let pinning = get_map_field(btf, m.btf_type)?;
                 map_def.pinning = PinningType::try_from(pinning).unwrap_or_else(|_| {
@@ -1556,6 +1573,7 @@ pub const fn parse_map_info(info: bpf_map_info, pinned: PinningType) -> Map {
                 pinning: pinned,
                 btf_key_type_id: info.btf_key_type_id,
                 btf_value_type_id: info.btf_value_type_id,
+                map_extra: info.map_extra,
             },
             section_index: 0,
             symbol_index: 0,

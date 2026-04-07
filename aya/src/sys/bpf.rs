@@ -60,6 +60,7 @@ pub(crate) fn bpf_create_map(
     u.value_size = def.value_size();
     u.max_entries = def.max_entries();
     u.map_flags = def.map_flags();
+    u.map_extra = def.map_extra();
 
     if let aya_obj::Map::Btf(m) = def {
         // Mimic https://github.com/libbpf/libbpf/issues/355
@@ -79,7 +80,8 @@ pub(crate) fn bpf_create_map(
             | bpf_map_type::BPF_MAP_TYPE_SOCKHASH
             | bpf_map_type::BPF_MAP_TYPE_QUEUE
             | bpf_map_type::BPF_MAP_TYPE_STACK
-            | bpf_map_type::BPF_MAP_TYPE_RINGBUF,
+            | bpf_map_type::BPF_MAP_TYPE_RINGBUF
+            | bpf_map_type::BPF_MAP_TYPE_ARENA,
         ) = u.map_type.try_into()
         {
             u.btf_key_type_id = 0;
