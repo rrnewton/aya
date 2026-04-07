@@ -1,4 +1,5 @@
 //! CO-RE post-processor library for BPF ELF objects.
+#![allow(unused_crate_dependencies)] // clap/toml used by the binary, not the library
 //!
 //! This crate provides the core logic for adding `bpf_core_relo` records
 //! to BPF ELF objects.  It can be used:
@@ -317,7 +318,7 @@ fn collect_struct_members(
         };
 
         let parent_name = vmlinux_btf.string_at(common.name_off)?.to_string();
-        let struct_size = common.size_or_type;
+        let _struct_size = common.size_or_type;
         let is_last = depth == field_parts.len() - 1;
 
         // Find the member in vmlinux BTF.

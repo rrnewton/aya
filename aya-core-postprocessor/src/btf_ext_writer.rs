@@ -53,6 +53,7 @@ struct SectionRelos {
 pub struct BtfExtWriter<'a> {
     btf: &'a BtfInfo,
     /// Existing .BTF.ext raw data (if any).
+    #[allow(dead_code)]
     existing_ext_data: Option<Vec<u8>>,
     /// New CO-RE relocation records grouped by section name.
     new_relos: Vec<(String, Vec<CoreReloRecord>)>,
