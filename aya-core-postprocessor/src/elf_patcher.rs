@@ -316,3 +316,275 @@ fn write_u32_le(data: &mut [u8], offset: usize, val: u32) {
 fn write_u64_le(data: &mut [u8], offset: usize, val: u64) {
     data[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal BPF ELF with .BTF, .BTF.ext, .rel.BTF, .rel.BTF.ext,
+    /// and a program section.
+    fn build_test_elf_with_rel_sections() -> Vec<u8> {
+        // Build section name string table
+        let mut shstrtab = vec![0u8]; // index 0 = empty string
+        let btf_name = shstrtab.len() as u32;
+        shstrtab.extend_from_slice(b".BTF\0");
+        let btf_ext_name = shstrtab.len() as u32;
+        shstrtab.extend_from_slice(b".BTF.ext\0");
+        let rel_btf_name = shstrtab.len() as u32;
+        shstrtab.extend_from_slice(b".rel.BTF\0");
+        let rel_btf_ext_name = shstrtab.len() as u32;
+        shstrtab.extend_from_slice(b".rel.BTF.ext\0");
+        let shstrtab_name = shstrtab.len() as u32;
+        shstrtab.extend_from_slice(b".shstrtab\0");
+        let tp_test_name = shstrtab.len() as u32;
+        shstrtab.extend_from_slice(b"tp/test\0");
+
+        // Original .BTF content (16 bytes of dummy data)
+        let orig_btf = vec![0x9Fu8, 0xEB, 1, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        // Original .BTF.ext content (32 bytes of dummy data)
+        let orig_btf_ext = vec![0x9F, 0xEB, 1, 0, 32, 0, 0, 0,
+                                 0, 0, 0, 0, 0, 0, 0, 0,
+                                 0, 0, 0, 0, 0, 0, 0, 0,
+                                 0, 0, 0, 0, 0, 0, 0, 0];
+
+        // .rel.BTF — stale relocation data (24 bytes = 3 entries of 8 bytes each)
+        let rel_btf = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+                           0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                           0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
+
+        // .rel.BTF.ext — stale relocation data
+        let rel_btf_ext = vec![0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88,
+                               0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00];
+
+        // Program section (4 NOP instructions)
+        let tp_test = vec![0x07u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                           0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                           0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                           0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+        // Build ELF: header + section data + section headers
+        // Sections: [0]=NULL, [1]=.BTF, [2]=.BTF.ext, [3]=.rel.BTF,
+        //           [4]=.rel.BTF.ext, [5]=.shstrtab, [6]=tp/test
+        let num_sections = 7usize;
+        let shstrtab_idx = 5usize;
+
+        let mut elf = vec![0u8; ELF64_EHDR_SIZE];
+        // ELF magic
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        write_u16_le(&mut elf, 16, 1); // e_type = ET_REL
+        write_u16_le(&mut elf, 18, 247); // e_machine = EM_BPF
+        write_u32_le(&mut elf, 20, 1); // e_version
+        write_u16_le(&mut elf, 52, ELF64_EHDR_SIZE as u16); // e_ehsize
+        write_u16_le(&mut elf, 58, ELF64_SHDR_SIZE as u16); // e_shentsize
+        write_u16_le(&mut elf, 62, shstrtab_idx as u16); // e_shstrndx
+
+        // Write section data (each aligned to 4 bytes)
+        let sections_data: Vec<(&[u8], u32, u32)> = vec![
+            // (data, sh_name, sh_type)
+            (&orig_btf, btf_name, 1),           // .BTF (SHT_PROGBITS)
+            (&orig_btf_ext, btf_ext_name, 1),   // .BTF.ext (SHT_PROGBITS)
+            (&rel_btf, rel_btf_name, 9),        // .rel.BTF (SHT_REL)
+            (&rel_btf_ext, rel_btf_ext_name, 9),// .rel.BTF.ext (SHT_REL)
+            (&shstrtab, shstrtab_name, 3),       // .shstrtab (SHT_STRTAB)
+            (&tp_test, tp_test_name, 1),         // tp/test (SHT_PROGBITS)
+        ];
+
+        let mut offsets = vec![(0usize, 0usize)]; // NULL section
+        for (data, _, _) in &sections_data {
+            let align = 4;
+            let padding = (align - (elf.len() % align)) % align;
+            elf.extend(std::iter::repeat(0u8).take(padding));
+            let offset = elf.len();
+            elf.extend_from_slice(data);
+            offsets.push((offset, data.len()));
+        }
+
+        // Align for section headers
+        let padding = (8 - (elf.len() % 8)) % 8;
+        elf.extend(std::iter::repeat(0u8).take(padding));
+        let shoff = elf.len();
+        write_u64_le(&mut elf, 40, shoff as u64); // e_shoff
+        write_u16_le(&mut elf, 60, num_sections as u16); // e_shnum
+
+        // Write section headers
+        // [0] NULL
+        elf.extend_from_slice(&[0u8; ELF64_SHDR_SIZE]);
+
+        for (i, (data, sh_name, sh_type)) in sections_data.iter().enumerate() {
+            let (off, sz) = offsets[i + 1];
+            let mut shdr = [0u8; ELF64_SHDR_SIZE];
+            write_u32_le(&mut shdr, 0, *sh_name);
+            write_u32_le(&mut shdr, 4, *sh_type);
+            write_u64_le(&mut shdr, 24, off as u64);
+            write_u64_le(&mut shdr, 32, sz as u64);
+            write_u64_le(&mut shdr, 48, 4); // sh_addralign
+            if *sh_type == 9 { // SHT_REL
+                write_u64_le(&mut shdr, 56, 16); // sh_entsize
+            }
+            let _ = data; // suppress unused warning
+            elf.extend_from_slice(&shdr);
+        }
+
+        elf
+    }
+
+    #[test]
+    fn test_rel_btf_sections_are_zeroed() {
+        let elf = build_test_elf_with_rel_sections();
+
+        // Verify the original has non-zero .rel.BTF and .rel.BTF.ext
+        let e_shoff = read_u64_le(&elf, 40) as usize;
+        let e_shnum = read_u16_le(&elf, 60) as usize;
+        let e_shstrndx = read_u16_le(&elf, 62) as usize;
+        let shstrtab_shdr = e_shoff + e_shstrndx * ELF64_SHDR_SIZE;
+        let shstrtab_off = read_u64_le(&elf, shstrtab_shdr + 24) as usize;
+        let shstrtab_size = read_u64_le(&elf, shstrtab_shdr + 32) as usize;
+        let shstrtab_data = &elf[shstrtab_off..shstrtab_off + shstrtab_size];
+
+        let section_name = |idx: usize| -> String {
+            let shdr = e_shoff + idx * ELF64_SHDR_SIZE;
+            let name_off = read_u32_le(&elf, shdr) as usize;
+            let end = shstrtab_data[name_off..].iter().position(|&b| b == 0)
+                .map(|p| name_off + p).unwrap_or(shstrtab_data.len());
+            String::from_utf8_lossy(&shstrtab_data[name_off..end]).to_string()
+        };
+
+        // Find .rel.BTF section and verify it has non-zero content
+        let mut found_rel_btf = false;
+        for i in 0..e_shnum {
+            if section_name(i) == ".rel.BTF" {
+                let shdr = e_shoff + i * ELF64_SHDR_SIZE;
+                let size = read_u64_le(&elf, shdr + 32) as usize;
+                assert!(size > 0, "original .rel.BTF should have data");
+                found_rel_btf = true;
+            }
+        }
+        assert!(found_rel_btf, ".rel.BTF section should exist in test ELF");
+
+        // Patch the ELF
+        let new_btf = vec![0x9Fu8, 0xEB, 1, 0, 24, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 42, 0, 0, 0]; // slightly different
+        let new_btf_ext = vec![0x9F, 0xEB, 1, 0, 32, 0, 0, 0,
+                               0, 0, 0, 0, 0, 0, 0, 0,
+                               0, 0, 0, 0, 0, 0, 0, 0,
+                               0, 0, 0, 0, 0, 0, 0, 0];
+
+        let patched = patch_elf_sections(&elf, &new_btf, &new_btf_ext).unwrap();
+
+        // Verify .rel.BTF and .rel.BTF.ext sections are zeroed (size=0)
+        let e_shoff = read_u64_le(&patched, 40) as usize;
+        let e_shnum = read_u16_le(&patched, 60) as usize;
+        let e_shstrndx = read_u16_le(&patched, 62) as usize;
+        let shstrtab_shdr = e_shoff + e_shstrndx * ELF64_SHDR_SIZE;
+        let shstrtab_off = read_u64_le(&patched, shstrtab_shdr + 24) as usize;
+        let shstrtab_size = read_u64_le(&patched, shstrtab_shdr + 32) as usize;
+        let shstrtab_data = &patched[shstrtab_off..shstrtab_off + shstrtab_size];
+
+        let section_name = |idx: usize| -> String {
+            let shdr = e_shoff + idx * ELF64_SHDR_SIZE;
+            let name_off = read_u32_le(&patched, shdr) as usize;
+            let end = shstrtab_data[name_off..].iter().position(|&b| b == 0)
+                .map(|p| name_off + p).unwrap_or(shstrtab_data.len());
+            String::from_utf8_lossy(&shstrtab_data[name_off..end]).to_string()
+        };
+
+        for i in 0..e_shnum {
+            let name = section_name(i);
+            let shdr = e_shoff + i * ELF64_SHDR_SIZE;
+            let size = read_u64_le(&patched, shdr + 32) as usize;
+
+            if name == ".rel.BTF" || name == ".rel.BTF.ext" {
+                assert_eq!(
+                    size, 0,
+                    "{name} section should have size=0 after patching (was stale)"
+                );
+            } else if name == ".BTF" {
+                assert_eq!(size, new_btf.len(), ".BTF should have new content size");
+            } else if name == ".BTF.ext" {
+                assert_eq!(size, new_btf_ext.len(), ".BTF.ext should have new content size");
+            }
+        }
+    }
+
+    #[test]
+    fn test_btf_content_is_replaced() {
+        let elf = build_test_elf_with_rel_sections();
+        let new_btf = vec![0xAAu8; 20]; // distinctive content
+        let new_btf_ext = vec![0xBBu8; 36];
+
+        let patched = patch_elf_sections(&elf, &new_btf, &new_btf_ext).unwrap();
+
+        // Find .BTF section and verify it has new content
+        let e_shoff = read_u64_le(&patched, 40) as usize;
+        let e_shnum = read_u16_le(&patched, 60) as usize;
+        let e_shstrndx = read_u16_le(&patched, 62) as usize;
+        let shstrtab_shdr = e_shoff + e_shstrndx * ELF64_SHDR_SIZE;
+        let shstrtab_off = read_u64_le(&patched, shstrtab_shdr + 24) as usize;
+        let shstrtab_size = read_u64_le(&patched, shstrtab_shdr + 32) as usize;
+        let shstrtab_data = &patched[shstrtab_off..shstrtab_off + shstrtab_size];
+
+        let section_name = |idx: usize| -> String {
+            let shdr = e_shoff + idx * ELF64_SHDR_SIZE;
+            let name_off = read_u32_le(&patched, shdr) as usize;
+            let end = shstrtab_data[name_off..].iter().position(|&b| b == 0)
+                .map(|p| name_off + p).unwrap_or(shstrtab_data.len());
+            String::from_utf8_lossy(&shstrtab_data[name_off..end]).to_string()
+        };
+
+        for i in 0..e_shnum {
+            let shdr = e_shoff + i * ELF64_SHDR_SIZE;
+            let off = read_u64_le(&patched, shdr + 24) as usize;
+            let size = read_u64_le(&patched, shdr + 32) as usize;
+
+            if section_name(i) == ".BTF" {
+                assert_eq!(size, 20);
+                assert_eq!(&patched[off..off + size], &[0xAA; 20]);
+            } else if section_name(i) == ".BTF.ext" {
+                assert_eq!(size, 36);
+                assert_eq!(&patched[off..off + size], &[0xBB; 36]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_program_section_preserved() {
+        let elf = build_test_elf_with_rel_sections();
+        let new_btf = vec![0u8; 16];
+        let new_btf_ext = vec![0u8; 32];
+
+        let patched = patch_elf_sections(&elf, &new_btf, &new_btf_ext).unwrap();
+
+        // Verify tp/test program section is unchanged
+        let e_shoff = read_u64_le(&patched, 40) as usize;
+        let e_shnum = read_u16_le(&patched, 60) as usize;
+        let e_shstrndx = read_u16_le(&patched, 62) as usize;
+        let shstrtab_shdr = e_shoff + e_shstrndx * ELF64_SHDR_SIZE;
+        let shstrtab_off = read_u64_le(&patched, shstrtab_shdr + 24) as usize;
+        let shstrtab_size = read_u64_le(&patched, shstrtab_shdr + 32) as usize;
+        let shstrtab_data = &patched[shstrtab_off..shstrtab_off + shstrtab_size];
+
+        let section_name = |idx: usize| -> String {
+            let shdr = e_shoff + idx * ELF64_SHDR_SIZE;
+            let name_off = read_u32_le(&patched, shdr) as usize;
+            let end = shstrtab_data[name_off..].iter().position(|&b| b == 0)
+                .map(|p| name_off + p).unwrap_or(shstrtab_data.len());
+            String::from_utf8_lossy(&shstrtab_data[name_off..end]).to_string()
+        };
+
+        let mut found = false;
+        for i in 0..e_shnum {
+            if section_name(i) == "tp/test" {
+                let shdr = e_shoff + i * ELF64_SHDR_SIZE;
+                let size = read_u64_le(&patched, shdr + 32) as usize;
+                assert_eq!(size, 32, "tp/test section should be preserved");
+                found = true;
+            }
+        }
+        assert!(found, "tp/test section should exist");
+    }
+}

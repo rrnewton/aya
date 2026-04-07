@@ -472,4 +472,186 @@ mod tests {
             0
         );
     }
+
+    /// Regression test: stale core_relo records from existing .BTF.ext must
+    /// NOT be copied into the output.
+    ///
+    /// When the postprocessor replaces the .BTF section with new stub types,
+    /// any pre-existing core_relo records have type_ids that reference the
+    /// OLD BTF layout. Copying them would cause "field relocation on a type
+    /// that doesn't have fields" errors at load time.
+    #[test]
+    fn test_stale_core_relo_records_are_stripped() {
+        let writer = BtfExtWriter {
+            btf: &BtfInfo {
+                header: crate::btf_parser::BtfHeader {
+                    magic: 0xEB9F,
+                    version: 1,
+                    flags: 0,
+                    hdr_len: 24,
+                    type_off: 0,
+                    type_len: 0,
+                    str_off: 0,
+                    str_len: 1,
+                },
+                types: vec![],
+                strings: vec![0],
+                raw_header_len: 24,
+                appended_type_data: Vec::new(),
+            },
+            existing_ext_data: None,
+            new_relos: Vec::new(),
+            added_strings: Vec::new(),
+        };
+
+        // Simulate existing core_relo data with a stale record.
+        // Format: rec_size(4) + sec_name_off(4) + num_info(4) + record(16) = 28 bytes
+        let mut existing = Vec::new();
+        existing.extend_from_slice(&16u32.to_le_bytes()); // rec_size
+        existing.extend_from_slice(&10u32.to_le_bytes()); // sec_name_off
+        existing.extend_from_slice(&1u32.to_le_bytes());  // num_info = 1
+        // A stale record with type_id=999 (references old BTF)
+        existing.extend_from_slice(&80u32.to_le_bytes());  // insn_off
+        existing.extend_from_slice(&999u32.to_le_bytes()); // type_id (stale!)
+        existing.extend_from_slice(&50u32.to_le_bytes());  // access_str_off
+        existing.extend_from_slice(&0u32.to_le_bytes());   // kind
+
+        // New valid relocation
+        let new_relos = vec![SectionRelos {
+            sec_name_off: 42,
+            records: vec![CoreReloRecord {
+                insn_off: 40,
+                type_id: 7,
+                access_str_off: 100,
+                kind: 0,
+            }],
+        }];
+
+        let data = writer.build_core_relo_section(&existing, &new_relos);
+
+        // Output should contain ONLY the new record, NOT the stale one.
+        // rec_size(4) + sec_name_off(4) + num_info(4) + 1 record(16) = 28
+        assert_eq!(data.len(), 28);
+
+        // Verify the stale type_id=999 does NOT appear in the output
+        for i in (0..data.len()).step_by(4) {
+            if i + 4 <= data.len() {
+                let val = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+                assert_ne!(val, 999, "stale type_id 999 should not be in output");
+            }
+        }
+
+        // Verify the valid record IS present
+        let type_id = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        assert_eq!(type_id, 7, "new type_id should be preserved");
+    }
+
+    /// Verify that when no new relocations are added but existing ones exist,
+    /// the existing ones are still stripped (not passed through).
+    #[test]
+    fn test_existing_only_records_are_stripped() {
+        let writer = BtfExtWriter {
+            btf: &BtfInfo {
+                header: crate::btf_parser::BtfHeader {
+                    magic: 0xEB9F,
+                    version: 1,
+                    flags: 0,
+                    hdr_len: 24,
+                    type_off: 0,
+                    type_len: 0,
+                    str_off: 0,
+                    str_len: 1,
+                },
+                types: vec![],
+                strings: vec![0],
+                raw_header_len: 24,
+                appended_type_data: Vec::new(),
+            },
+            existing_ext_data: None,
+            new_relos: Vec::new(),
+            added_strings: Vec::new(),
+        };
+
+        // Existing stale records but no new ones.
+        let mut existing = Vec::new();
+        existing.extend_from_slice(&16u32.to_le_bytes());
+        existing.extend_from_slice(&10u32.to_le_bytes());
+        existing.extend_from_slice(&2u32.to_le_bytes()); // 2 stale records
+        for _ in 0..2 {
+            existing.extend_from_slice(&[0u8; 16]); // dummy records
+        }
+
+        let data = writer.build_core_relo_section(&existing, &[]);
+
+        // Should be just the rec_size header (4 bytes) with no actual records.
+        // The stale existing records are stripped. A 4-byte output containing
+        // only rec_size and no section groups is valid — the loader will see
+        // zero sections in the core_relo area.
+        assert!(data.len() <= 4, "should strip stale records; got {} bytes", data.len());
+
+        // Verify no stale data leaked through
+        if !data.is_empty() {
+            // Only rec_size should be present
+            assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 16);
+        }
+    }
+
+    /// Verify that valid new records are preserved correctly when there
+    /// are multiple sections with multiple records each.
+    #[test]
+    fn test_multiple_sections_multiple_records() {
+        let writer = BtfExtWriter {
+            btf: &BtfInfo {
+                header: crate::btf_parser::BtfHeader {
+                    magic: 0xEB9F,
+                    version: 1,
+                    flags: 0,
+                    hdr_len: 24,
+                    type_off: 0,
+                    type_len: 0,
+                    str_off: 0,
+                    str_len: 1,
+                },
+                types: vec![],
+                strings: vec![0],
+                raw_header_len: 24,
+                appended_type_data: Vec::new(),
+            },
+            existing_ext_data: None,
+            new_relos: Vec::new(),
+            added_strings: Vec::new(),
+        };
+
+        let new_relos = vec![
+            SectionRelos {
+                sec_name_off: 10,
+                records: vec![
+                    CoreReloRecord { insn_off: 0, type_id: 1, access_str_off: 20, kind: 0 },
+                    CoreReloRecord { insn_off: 8, type_id: 1, access_str_off: 24, kind: 0 },
+                ],
+            },
+            SectionRelos {
+                sec_name_off: 30,
+                records: vec![
+                    CoreReloRecord { insn_off: 16, type_id: 2, access_str_off: 40, kind: 0 },
+                ],
+            },
+        ];
+
+        let data = writer.build_core_relo_section(&[], &new_relos);
+
+        // rec_size(4) + section1(8 + 2*16) + section2(8 + 1*16) = 4 + 40 + 24 = 68
+        assert_eq!(data.len(), 68);
+
+        // Check rec_size
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 16);
+
+        // Section 1: sec_name=10, num_info=2
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 2);
+
+        // Section 2: sec_name=30, num_info=1
+        assert_eq!(u32::from_le_bytes(data[44..48].try_into().unwrap()), 30);
+        assert_eq!(u32::from_le_bytes(data[48..52].try_into().unwrap()), 1);
+    }
 }
