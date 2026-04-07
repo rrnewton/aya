@@ -6,5 +6,7 @@
 //! so we use inline assembly with `call {func}` + `sym` operands.
 
 pub mod arena;
+pub mod bump;
 
-pub use arena::{arena_alloc_pages, arena_free_pages};
+pub use arena::{arena_alloc_pages, arena_free_pages, cast_kern, cast_user, NUMA_NO_NODE};
+pub use bump::{bump_alloc, bump_destroy, bump_init, bump_memlimit, BumpAllocator};
