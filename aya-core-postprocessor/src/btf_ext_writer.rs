@@ -352,14 +352,19 @@ impl<'a> BtfExtWriter<'a> {
         // Write rec_size (4 bytes) -- always sizeof(bpf_core_relo) = 16.
         buf.extend_from_slice(&CORE_RELO_SIZE.to_le_bytes());
 
-        // Copy existing core_relo records (skip the rec_size prefix if present).
-        if !existing.is_empty() {
-            if existing.len() >= 4 {
-                // The existing data starts with rec_size, skip it since we
-                // already wrote ours.
-                buf.extend_from_slice(&existing[4..]);
-            }
-        }
+        // Do NOT copy existing core_relo records. When the postprocessor
+        // replaces the .BTF section with new type data, the type_ids in any
+        // pre-existing core_relo records become stale — they reference types
+        // from the OLD BTF layout that no longer exist. Only the
+        // postprocessor's new relocations have valid type_ids pointing to
+        // the newly-created stub structs.
+        //
+        // This was the root cause of the "field relocation on a type that
+        // doesn't have fields" error: the Rust compiler generated CO-RE
+        // relocations with type_ids from the original BTF, but after the
+        // postprocessor replaced the BTF, those type_ids pointed to wrong
+        // types (e.g., an Int instead of a Struct).
+        let _ = existing;
 
         // Append new relocation record groups.
         for section in new_relos {
