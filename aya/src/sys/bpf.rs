@@ -81,7 +81,8 @@ pub(crate) fn bpf_create_map(
                 | bpf_map_type::BPF_MAP_TYPE_SOCKHASH
                 | bpf_map_type::BPF_MAP_TYPE_QUEUE
                 | bpf_map_type::BPF_MAP_TYPE_STACK
-                | bpf_map_type::BPF_MAP_TYPE_RINGBUF,
+                | bpf_map_type::BPF_MAP_TYPE_RINGBUF
+                | bpf_map_type::BPF_MAP_TYPE_ARENA,
             ) => {
                 u.btf_key_type_id = 0;
                 u.btf_value_type_id = 0;

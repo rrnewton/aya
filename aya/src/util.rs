@@ -476,6 +476,32 @@ impl MMap {
         }
     }
 
+    /// Maps at a specific address. Used for arena maps where `map_extra` specifies the VA.
+    pub(crate) fn new_at(
+        fd: BorrowedFd<'_>,
+        addr: *mut c_void,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        offset: off_t,
+    ) -> Result<Self, SyscallError> {
+        match unsafe { mmap(addr, len, prot, flags, fd, offset) } {
+            MAP_FAILED => Err(SyscallError {
+                call: "mmap",
+                io_error: io::Error::last_os_error(),
+            }),
+            ptr => {
+                let ptr = ptr::NonNull::new(ptr).ok_or_else(|| {
+                    SyscallError {
+                        call: "mmap",
+                        io_error: io::Error::other("mmap returned null pointer"),
+                    }
+                })?;
+                Ok(Self { ptr, len })
+            }
+        }
+    }
+
     /// Maps the file at `path` for reading, using `mmap` with `MAP_PRIVATE`.
     pub(crate) fn map_copy_read_only(path: &Path) -> Result<Self, io::Error> {
         let file = File::open(path)?;

@@ -87,6 +87,8 @@ pub struct BtfMapDef {
     pub btf_key_type_id: u32,
     /// BTF type id of the map value
     pub btf_value_type_id: u32,
+    /// Extra map-specific data (e.g., VA hint for arena maps).
+    pub(crate) map_extra: u64,
 }
 
 /// The pinning type
@@ -226,11 +228,12 @@ impl Map {
         }
     }
 
-    /// Returns per-map-type extra fields.
+    /// Returns the `map_extra` value (e.g., VA hint for arena maps).
     pub const fn map_extra(&self) -> u64 {
         match self {
             Self::Legacy(_) => 0,
             Self::Btf(m) => m.def.map_extra,
+            Self::StructOps(_) => 0,
         }
     }
 
