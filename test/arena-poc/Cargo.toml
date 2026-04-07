@@ -1,0 +1,10 @@
+[package]
+name = "arena-poc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aya = { path = "../../aya" }
+aya-arena-common = { path = "../../aya-arena-common" }
+aya-obj = { path = "../../aya-obj" }

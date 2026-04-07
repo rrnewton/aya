@@ -126,6 +126,90 @@ impl ArenaNodeHeader {
     }
 }
 
+// ── PoC node types for heterogeneous arena linked list ─────────────────
+
+/// Type tag for [`CounterNode`].
+pub const TAG_COUNTER: u32 = 1;
+
+/// Type tag for [`LabelNode`].
+pub const TAG_LABEL: u32 = 2;
+
+/// Maximum label length in bytes (including nul terminator).
+pub const LABEL_MAX_LEN: usize = 32;
+
+/// A node containing a 64-bit counter value.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CounterNode {
+    /// Node header (must be first field for polymorphic access).
+    pub header: ArenaNodeHeader,
+    /// The counter value.
+    pub value: u64,
+}
+
+impl CounterNode {
+    /// Create a new counter node with the given value.
+    pub const fn new(value: u64) -> Self {
+        Self {
+            header: ArenaNodeHeader::new(TAG_COUNTER, size_of::<Self>() as u32),
+            value,
+        }
+    }
+}
+
+/// A node containing a fixed-size label string.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct LabelNode {
+    /// Node header (must be first field for polymorphic access).
+    pub header: ArenaNodeHeader,
+    /// Label bytes (nul-terminated).
+    pub label: [u8; LABEL_MAX_LEN],
+    /// Actual length of the label (excluding nul terminator).
+    pub len: u32,
+    /// Padding for alignment.
+    pub _pad: u32,
+}
+
+impl LabelNode {
+    /// Create a new label node from a byte slice.
+    ///
+    /// Truncates to [`LABEL_MAX_LEN`] - 1 bytes.
+    pub fn new(s: &[u8]) -> Self {
+        let mut label = [0u8; LABEL_MAX_LEN];
+        let copy_len = if s.len() < LABEL_MAX_LEN {
+            s.len()
+        } else {
+            LABEL_MAX_LEN - 1
+        };
+        let mut i = 0;
+        while i < copy_len {
+            label[i] = s[i];
+            i += 1;
+        }
+        Self {
+            header: ArenaNodeHeader::new(TAG_LABEL, size_of::<Self>() as u32),
+            label,
+            len: copy_len as u32,
+            _pad: 0,
+        }
+    }
+}
+
+/// Shared state stored at the beginning of the arena, readable by both
+/// BPF programs and userspace.
+///
+/// This is written by the BPF program and read by userspace to find the
+/// linked list.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ArenaListHead {
+    /// Offset to the first node in the linked list (from arena base).
+    pub head: ArenaPtr<ArenaNodeHeader>,
+    /// Number of nodes in the list.
+    pub count: u64,
+}
+
 /// A simple bump allocator state for arena memory.
 ///
 /// Tracks the current allocation watermark within an arena region.
@@ -223,5 +307,39 @@ mod tests {
         let mut bump = ArenaBumpState::new(64);
         assert!(bump.alloc(32, 8).is_some());
         assert!(bump.alloc(64, 8).is_none()); // exceeds capacity
+    }
+
+    #[test]
+    fn counter_node_layout() {
+        assert_eq!(mem::size_of::<CounterNode>(), 24); // 16 header + 8 value
+        assert_eq!(mem::align_of::<CounterNode>(), 8);
+    }
+
+    #[test]
+    fn label_node_layout() {
+        assert_eq!(mem::size_of::<LabelNode>(), 56); // 16 header + 32 label + 4 len + 4 pad
+        assert_eq!(mem::align_of::<LabelNode>(), 8);
+    }
+
+    #[test]
+    fn arena_list_head_layout() {
+        assert_eq!(mem::size_of::<ArenaListHead>(), 16); // 8 head + 8 count
+        assert_eq!(mem::align_of::<ArenaListHead>(), 8);
+    }
+
+    #[test]
+    fn counter_node_tag() {
+        let node = CounterNode::new(42);
+        assert_eq!(node.header.tag, TAG_COUNTER);
+        assert_eq!(node.value, 42);
+    }
+
+    #[test]
+    fn label_node_content() {
+        let node = LabelNode::new(b"hello");
+        assert_eq!(node.header.tag, TAG_LABEL);
+        assert_eq!(node.len, 5);
+        assert_eq!(&node.label[..5], b"hello");
+        assert_eq!(node.label[5], 0); // nul terminated
     }
 }
