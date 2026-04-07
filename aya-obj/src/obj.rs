@@ -1011,7 +1011,7 @@ impl Object {
     ///
     /// `kernel_btf` should be the vmlinux BTF loaded from `/sys/kernel/btf/vmlinux`.
     pub fn fixup_kfunc_calls(&mut self, kernel_btf: &Btf) {
-        use crate::generated::BPF_PSEUDO_KFUNC_CALL;
+        use crate::generated::{BPF_PSEUDO_KFUNC_CALL, BPF_ALU64, BPF_MOV};
 
         // Build a map of kfunc name → vmlinux BTF func type_id
         let mut kfunc_vmlinux_ids: BTreeMap<String, u32> = BTreeMap::new();
@@ -1087,7 +1087,33 @@ impl Object {
                     if let Some(name) = kfunc_name {
                         if let Some(&vmlinux_id) = kfunc_vmlinux_ids.get(name) {
                             ins.imm = vmlinux_id as i32;
+                        } else {
+                            // Kfunc not available in this kernel.
+                            // Replace with `mov r0, 0` so the verifier doesn't reject
+                            // the program if it explores this path. The BPF program
+                            // should check the return value (0 = "not available").
+                            log::warn!(
+                                "kfunc '{}' not in vmlinux BTF; replacing with mov r0,0 (function '{}')",
+                                name, function.name,
+                            );
+                            ins.code = (BPF_ALU64 | BPF_MOV | BPF_K) as u8;
+                            ins.set_dst_reg(0); // r0
+                            ins.set_src_reg(0);
+                            ins.off = 0;
+                            ins.imm = 0; // r0 = 0
                         }
+                    } else if ins.imm == 0 {
+                        // No name and imm=0: kfunc call that was never resolved.
+                        // Replace with mov r0, 0 to avoid verifier rejection.
+                        log::warn!(
+                            "unresolved kfunc at ins {} in '{}'; replacing with mov r0,0",
+                            ins_idx, function.name,
+                        );
+                        ins.code = (BPF_ALU64 | BPF_MOV | BPF_K) as u8;
+                        ins.set_dst_reg(0);
+                        ins.set_src_reg(0);
+                        ins.off = 0;
+                        ins.imm = 0;
                     }
                 }
             }
