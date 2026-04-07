@@ -253,6 +253,160 @@ impl ArenaBumpState {
     }
 }
 
+// ── Arena Slab Allocator ──────────────────────────────────────────────
+//
+// Fixed-size slot allocator with O(1) alloc and free. Uses an intrusive
+// free list: each free slot stores an ArenaPtr to the next free slot.
+// When the free list is empty, falls back to bump allocation.
+//
+// Ideal for BPF task contexts: init_task allocates a slot, exit_task
+// frees it, and the next init_task reuses it immediately.
+
+/// Minimum slot size (must fit an ArenaPtr for the free list link).
+pub const SLAB_MIN_SLOT_SIZE: u32 = 8;
+
+/// State for the arena slab allocator.
+///
+/// Manages fixed-size slots with O(1) alloc (pop free list or bump)
+/// and O(1) free (push to free list). All operations are BPF verifier
+/// safe — no loops, no recursion.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ArenaSlabState {
+    /// Fallback bump allocator for when the free list is empty.
+    pub bump: ArenaBumpState,
+    /// Head of the intrusive free list (null = empty).
+    pub free_head: ArenaPtr<u8>,
+    /// Size of each slot in bytes (fixed at init, must be >= 8).
+    pub slot_size: u32,
+    /// Number of slots currently in the free list.
+    pub free_count: u32,
+    /// Total number of slots ever allocated from the bump region.
+    pub total_allocated: u32,
+    /// Padding for 8-byte alignment.
+    pub _pad: u32,
+}
+
+/// Initialize a slab allocator.
+///
+/// `slab` must point to valid, writable memory.
+/// `capacity` is the total arena region size in bytes.
+/// `slot_size` must be >= [`SLAB_MIN_SLOT_SIZE`] (8 bytes) and a
+/// multiple of 8 (for alignment).
+///
+/// Returns 0 on success, -1 if `slot_size` is invalid.
+///
+/// # Safety
+///
+/// `slab` must point to valid, writable memory for an `ArenaSlabState`.
+pub unsafe fn arena_slab_init(
+    slab: *mut ArenaSlabState,
+    capacity: u64,
+    slot_size: u32,
+) -> i32 {
+    if slot_size < SLAB_MIN_SLOT_SIZE || !slot_size.is_multiple_of(8) {
+        return -1;
+    }
+    core::ptr::write(
+        slab,
+        ArenaSlabState {
+            bump: ArenaBumpState::new(capacity),
+            free_head: ArenaPtr::null(),
+            slot_size,
+            free_count: 0,
+            total_allocated: 0,
+            _pad: 0,
+        },
+    );
+    0
+}
+
+/// Allocate a slot from the slab.
+///
+/// Returns an `ArenaPtr` to the slot, or a null `ArenaPtr` if the
+/// slab is exhausted (free list empty AND bump region full).
+///
+/// O(1): pops from the free list if non-empty, otherwise bump-allocates.
+///
+/// # Safety
+///
+/// `slab` must point to a valid, initialized `ArenaSlabState`.
+/// `arena_base` must be the arena base address.
+pub unsafe fn arena_slab_alloc(slab: *mut ArenaSlabState, arena_base: *mut u8) -> ArenaPtr<u8> {
+    let s = &mut *slab;
+
+    // Fast path: pop from free list
+    if !s.free_head.is_null() {
+        let slot_ptr = s.free_head;
+        // Read the next-free pointer stored in the slot itself
+        let slot = slot_ptr.resolve(arena_base);
+        let next = core::ptr::read(slot.cast::<ArenaPtr<u8>>());
+        s.free_head = next;
+        s.free_count -= 1;
+        return slot_ptr;
+    }
+
+    // Slow path: bump-allocate a new slot
+    match s.bump.alloc(u64::from(s.slot_size), 8) {
+        Some(offset) => {
+            s.total_allocated += 1;
+            ArenaPtr::from_offset(offset)
+        }
+        None => ArenaPtr::null(), // Exhausted
+    }
+}
+
+/// Free a slot back to the slab.
+///
+/// The slot is pushed onto the free list for reuse. O(1).
+///
+/// # Safety
+///
+/// `slab` must point to a valid, initialized `ArenaSlabState`.
+/// `slot` must be a valid `ArenaPtr` previously returned by
+/// [`arena_slab_alloc`] on this slab.
+/// `arena_base` must be the arena base address.
+pub unsafe fn arena_slab_free(
+    slab: *mut ArenaSlabState,
+    slot: ArenaPtr<u8>,
+    arena_base: *mut u8,
+) {
+    let s = &mut *slab;
+
+    // Write the current free_head into the slot (intrusive link)
+    let slot_raw = slot.resolve(arena_base);
+    core::ptr::write(slot_raw.cast::<ArenaPtr<u8>>(), s.free_head);
+
+    // Push slot onto the free list
+    s.free_head = slot;
+    s.free_count += 1;
+}
+
+/// Slab allocator statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArenaSlabStats {
+    /// Total slots ever bump-allocated.
+    pub total_allocated: u32,
+    /// Slots currently in the free list (available for reuse).
+    pub free_count: u32,
+    /// Slots currently in use (total_allocated - free_count).
+    pub in_use: u32,
+}
+
+/// Get slab allocator statistics.
+///
+/// # Safety
+///
+/// `slab` must point to a valid, initialized `ArenaSlabState`.
+pub unsafe fn arena_slab_stats(slab: *const ArenaSlabState) -> ArenaSlabStats {
+    let s = &*slab;
+    ArenaSlabStats {
+        total_allocated: s.total_allocated,
+        free_count: s.free_count,
+        in_use: s.total_allocated - s.free_count,
+    }
+}
+
 // ── Arena Hash Map ────────────────────────────────────────────────────
 //
 // Open-addressing hash map with linear probing, designed for shared
@@ -1958,5 +2112,300 @@ mod tests {
                 prev = Some(k);
             });
         }
+    }
+
+    // ── Slab allocator tests ─────────────────────────────────────────
+
+    /// Helper: create a simulated arena with a slab allocator.
+    /// The slab header lives at the start of the buffer. The bump region
+    /// (where slots are allocated) starts right after the header.
+    fn make_slab(capacity: usize, slot_size: u32) -> (Vec<u8>, *mut ArenaSlabState) {
+        let header_size = mem::size_of::<ArenaSlabState>();
+        let total = header_size + capacity;
+        let mut buf = vec![0u8; total];
+        let base = buf.as_mut_ptr();
+        let slab = base.cast::<ArenaSlabState>();
+        let ret = unsafe { arena_slab_init(slab, (total) as u64, slot_size) };
+        assert_eq!(ret, 0, "slab init failed");
+        // Advance bump watermark past the header so allocations don't
+        // overlap with the ArenaSlabState itself.
+        unsafe { (*slab).bump.watermark = header_size as u64 };
+        (buf, slab)
+    }
+
+    #[test]
+    fn slab_state_layout() {
+        assert_eq!(mem::size_of::<ArenaSlabState>(), 40);
+        assert_eq!(mem::align_of::<ArenaSlabState>(), 8);
+    }
+
+    #[test]
+    fn slab_init_valid() {
+        let (_buf, slab) = make_slab(4096, 64);
+        let stats = unsafe { arena_slab_stats(slab) };
+        assert_eq!(stats.total_allocated, 0);
+        assert_eq!(stats.free_count, 0);
+        assert_eq!(stats.in_use, 0);
+    }
+
+    #[test]
+    fn slab_init_rejects_too_small() {
+        let mut buf = vec![0u8; 256];
+        let slab = buf.as_mut_ptr().cast::<ArenaSlabState>();
+        assert_eq!(unsafe { arena_slab_init(slab, 256, 4) }, -1);
+        assert_eq!(unsafe { arena_slab_init(slab, 256, 12) }, -1);
+        assert_eq!(unsafe { arena_slab_init(slab, 256, 0) }, -1);
+    }
+
+    #[test]
+    fn slab_alloc_one() {
+        let (mut buf, slab) = make_slab(4096, 64);
+        let base = buf.as_mut_ptr();
+
+        let slot = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!slot.is_null());
+
+        let stats = unsafe { arena_slab_stats(slab) };
+        assert_eq!(stats.total_allocated, 1);
+        assert_eq!(stats.free_count, 0);
+        assert_eq!(stats.in_use, 1);
+    }
+
+    #[test]
+    fn slab_free_and_realloc() {
+        let (mut buf, slab) = make_slab(4096, 64);
+        let base = buf.as_mut_ptr();
+
+        let slot = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!slot.is_null());
+
+        unsafe { arena_slab_free(slab, slot, base) };
+        let stats = unsafe { arena_slab_stats(slab) };
+        assert_eq!(stats.free_count, 1);
+        assert_eq!(stats.in_use, 0);
+
+        // Realloc — should get the same slot back (LIFO free list)
+        let slot2 = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!slot2.is_null());
+        assert_eq!(slot.offset(), slot2.offset());
+
+        let stats = unsafe { arena_slab_stats(slab) };
+        assert_eq!(stats.total_allocated, 1); // No new bump allocation
+        assert_eq!(stats.free_count, 0);
+        assert_eq!(stats.in_use, 1);
+    }
+
+    #[test]
+    fn slab_multiple_alloc_free_cycle() {
+        let (mut buf, slab) = make_slab(4096, 32);
+        let base = buf.as_mut_ptr();
+
+        let mut slots = Vec::new();
+        for _ in 0..10 {
+            let s = unsafe { arena_slab_alloc(slab, base) };
+            assert!(!s.is_null());
+            slots.push(s);
+        }
+        assert_eq!(unsafe { arena_slab_stats(slab) }.in_use, 10);
+
+        for s in &slots {
+            unsafe { arena_slab_free(slab, *s, base) };
+        }
+        let stats = unsafe { arena_slab_stats(slab) };
+        assert_eq!(stats.free_count, 10);
+        assert_eq!(stats.in_use, 0);
+
+        let mut reslots = Vec::new();
+        for _ in 0..10 {
+            let s = unsafe { arena_slab_alloc(slab, base) };
+            assert!(!s.is_null());
+            reslots.push(s);
+        }
+        assert_eq!(unsafe { arena_slab_stats(slab) }.total_allocated, 10);
+        assert_eq!(unsafe { arena_slab_stats(slab) }.in_use, 10);
+        assert_eq!(unsafe { arena_slab_stats(slab) }.free_count, 0);
+    }
+
+    #[test]
+    fn slab_exhaust_capacity() {
+        let (mut buf, slab) = make_slab(192, 64);
+        let base = buf.as_mut_ptr();
+
+        let s1 = unsafe { arena_slab_alloc(slab, base) };
+        let s2 = unsafe { arena_slab_alloc(slab, base) };
+        let s3 = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!s1.is_null());
+        assert!(!s2.is_null());
+        assert!(!s3.is_null());
+
+        let s4 = unsafe { arena_slab_alloc(slab, base) };
+        assert!(s4.is_null());
+    }
+
+    #[test]
+    fn slab_exhaust_then_free_then_alloc() {
+        let (mut buf, slab) = make_slab(128, 64);
+        let base = buf.as_mut_ptr();
+
+        let s1 = unsafe { arena_slab_alloc(slab, base) };
+        let s2 = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!s1.is_null());
+        assert!(!s2.is_null());
+
+        let s3 = unsafe { arena_slab_alloc(slab, base) };
+        assert!(s3.is_null()); // Exhausted
+
+        unsafe { arena_slab_free(slab, s1, base) };
+
+        let s4 = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!s4.is_null());
+        assert_eq!(s4.offset(), s1.offset()); // Reused
+    }
+
+    #[test]
+    fn slab_interleaved_alloc_free() {
+        let (mut buf, slab) = make_slab(4096, 24);
+        let base = buf.as_mut_ptr();
+
+        let a = unsafe { arena_slab_alloc(slab, base) };
+        let _b = unsafe { arena_slab_alloc(slab, base) };
+        unsafe { arena_slab_free(slab, a, base) };
+        let c = unsafe { arena_slab_alloc(slab, base) };
+        assert_eq!(c.offset(), a.offset()); // C reuses A's slot
+
+        let stats = unsafe { arena_slab_stats(slab) };
+        assert_eq!(stats.total_allocated, 2);
+        assert_eq!(stats.in_use, 2);
+    }
+
+    #[test]
+    fn slab_write_and_read_data() {
+        let (mut buf, slab) = make_slab(4096, 24);
+        let base = buf.as_mut_ptr();
+
+        let slot = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!slot.is_null());
+
+        let ptr = unsafe { slot.resolve(base) };
+        unsafe { core::ptr::write(ptr.cast::<u64>(), 0xDEADBEEF_CAFEBABE) };
+        let val = unsafe { core::ptr::read(ptr.cast::<u64>()) };
+        assert_eq!(val, 0xDEADBEEF_CAFEBABE);
+
+        // Free and realloc — can write new data
+        unsafe { arena_slab_free(slab, slot, base) };
+        let slot2 = unsafe { arena_slab_alloc(slab, base) };
+        assert_eq!(slot2.offset(), slot.offset());
+        unsafe { core::ptr::write(slot2.resolve(base).cast::<u64>(), 42) };
+        assert_eq!(unsafe { core::ptr::read(slot2.resolve(base).cast::<u64>()) }, 42);
+    }
+
+    #[test]
+    fn slab_free_list_lifo_order() {
+        let (mut buf, slab) = make_slab(4096, 16);
+        let base = buf.as_mut_ptr();
+
+        let a = unsafe { arena_slab_alloc(slab, base) };
+        let b = unsafe { arena_slab_alloc(slab, base) };
+        let c = unsafe { arena_slab_alloc(slab, base) };
+
+        // Free A, B, C → list is C→B→A (LIFO)
+        unsafe { arena_slab_free(slab, a, base) };
+        unsafe { arena_slab_free(slab, b, base) };
+        unsafe { arena_slab_free(slab, c, base) };
+
+        // Alloc returns LIFO: C, B, A
+        let r1 = unsafe { arena_slab_alloc(slab, base) };
+        let r2 = unsafe { arena_slab_alloc(slab, base) };
+        let r3 = unsafe { arena_slab_alloc(slab, base) };
+        assert_eq!(r1.offset(), c.offset());
+        assert_eq!(r2.offset(), b.offset());
+        assert_eq!(r3.offset(), a.offset());
+    }
+
+    #[test]
+    fn slab_stress_100_cycles() {
+        let (mut buf, slab) = make_slab(8192, 32);
+        let base = buf.as_mut_ptr();
+
+        let mut slots: Vec<ArenaPtr<u8>> = Vec::new();
+        for _ in 0..50 {
+            let s = unsafe { arena_slab_alloc(slab, base) };
+            assert!(!s.is_null());
+            slots.push(s);
+        }
+
+        // 3 full free+realloc cycles
+        for _cycle in 0..3 {
+            for s in &slots {
+                unsafe { arena_slab_free(slab, *s, base) };
+            }
+            assert_eq!(unsafe { arena_slab_stats(slab) }.free_count, 50);
+
+            let mut reslots = Vec::new();
+            for _ in 0..50 {
+                let s = unsafe { arena_slab_alloc(slab, base) };
+                assert!(!s.is_null());
+                reslots.push(s);
+            }
+            slots = reslots;
+            assert_eq!(unsafe { arena_slab_stats(slab) }.free_count, 0);
+        }
+
+        // No new bump allocs after first round
+        assert_eq!(unsafe { arena_slab_stats(slab) }.total_allocated, 50);
+    }
+
+    #[test]
+    fn slab_large_slot_size() {
+        let (mut buf, slab) = make_slab(4096, 256);
+        let base = buf.as_mut_ptr();
+
+        let s1 = unsafe { arena_slab_alloc(slab, base) };
+        let s2 = unsafe { arena_slab_alloc(slab, base) };
+        assert!(!s1.is_null());
+        assert!(!s2.is_null());
+
+        let off1 = s1.offset().unwrap();
+        let off2 = s2.offset().unwrap();
+        assert_eq!(off2 - off1, 256);
+
+        unsafe { arena_slab_free(slab, s1, base) };
+        let s3 = unsafe { arena_slab_alloc(slab, base) };
+        assert_eq!(s3.offset(), s1.offset());
+    }
+
+    #[test]
+    fn slab_stats_accuracy_through_operations() {
+        let (mut buf, slab) = make_slab(4096, 16);
+        let base = buf.as_mut_ptr();
+
+        assert_eq!(unsafe { arena_slab_stats(slab) }, ArenaSlabStats {
+            total_allocated: 0, free_count: 0, in_use: 0,
+        });
+
+        let a = unsafe { arena_slab_alloc(slab, base) };
+        assert_eq!(unsafe { arena_slab_stats(slab) }, ArenaSlabStats {
+            total_allocated: 1, free_count: 0, in_use: 1,
+        });
+
+        let b = unsafe { arena_slab_alloc(slab, base) };
+        assert_eq!(unsafe { arena_slab_stats(slab) }, ArenaSlabStats {
+            total_allocated: 2, free_count: 0, in_use: 2,
+        });
+
+        unsafe { arena_slab_free(slab, a, base) };
+        assert_eq!(unsafe { arena_slab_stats(slab) }, ArenaSlabStats {
+            total_allocated: 2, free_count: 1, in_use: 1,
+        });
+
+        let _c = unsafe { arena_slab_alloc(slab, base) };
+        assert_eq!(unsafe { arena_slab_stats(slab) }, ArenaSlabStats {
+            total_allocated: 2, free_count: 0, in_use: 2,
+        });
+
+        unsafe { arena_slab_free(slab, b, base) };
+        assert_eq!(unsafe { arena_slab_stats(slab) }, ArenaSlabStats {
+            total_allocated: 2, free_count: 1, in_use: 1,
+        });
     }
 }

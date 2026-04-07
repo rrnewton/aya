@@ -6,8 +6,9 @@
 
 use aya_arena_common::{
     ArenaBTreeMap, ArenaBumpState, ArenaHashEntry, ArenaHashMap, ArenaNodeHeader, ArenaPtr,
-    CounterNode, arena_btree_for_each, arena_btree_get, arena_btree_init,
+    ArenaSlabState, CounterNode, arena_btree_for_each, arena_btree_get, arena_btree_init,
     arena_btree_insert, arena_hash_delete, arena_hash_get, arena_hash_init, arena_hash_insert,
+    arena_slab_alloc, arena_slab_free, arena_slab_init,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -557,6 +558,107 @@ fn bench_std_btree_iterate(count: u32) -> BenchResult {
     }
 }
 
+// ── Slab allocator benchmarks ─────────────────────────────────────────
+
+fn bench_slab_alloc_free_cycle(count: u32, slot_size: u32) -> BenchResult {
+    let header_size = size_of::<ArenaSlabState>();
+    let arena_size = header_size + (count as usize) * (slot_size as usize) + 4096;
+    let mut buf = vec![0u8; arena_size];
+    let base = buf.as_mut_ptr();
+    let slab = base.cast::<ArenaSlabState>();
+    unsafe {
+        arena_slab_init(slab, arena_size as u64, slot_size);
+        (*slab).bump.watermark = header_size as u64;
+    }
+
+    // Pre-allocate all slots, then free them to fill the free list
+    let mut slots: Vec<ArenaPtr<u8>> = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        slots.push(unsafe { arena_slab_alloc(slab, base) });
+    }
+    for &s in &slots {
+        unsafe { arena_slab_free(slab, s, base) };
+    }
+
+    // Benchmark: alloc + free cycle (all from free list)
+    let ops = count as u64;
+    let elapsed = bench(1, || {
+        for _ in 0..count {
+            let s = unsafe { arena_slab_alloc(slab, base) };
+            unsafe { arena_slab_free(slab, s, base) };
+        }
+    });
+
+    BenchResult {
+        name: format!("slab alloc+free cycle {count}x {slot_size}B"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
+fn bench_slab_alloc_only(count: u32, slot_size: u32) -> BenchResult {
+    let header_size = size_of::<ArenaSlabState>();
+    let arena_size = header_size + (count as usize) * (slot_size as usize) + 4096;
+    let mut buf = vec![0u8; arena_size];
+    let base = buf.as_mut_ptr();
+    let slab = base.cast::<ArenaSlabState>();
+    unsafe {
+        arena_slab_init(slab, arena_size as u64, slot_size);
+        (*slab).bump.watermark = header_size as u64;
+    }
+
+    // Pre-alloc and free to fill the free list
+    let mut slots: Vec<ArenaPtr<u8>> = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        slots.push(unsafe { arena_slab_alloc(slab, base) });
+    }
+    for &s in &slots {
+        unsafe { arena_slab_free(slab, s, base) };
+    }
+
+    // Benchmark: alloc-only from free list
+    let ops = count as u64;
+    let elapsed = bench(1, || {
+        for _ in 0..count {
+            let s = unsafe { arena_slab_alloc(slab, base) };
+            std::hint::black_box(s);
+        }
+    });
+
+    BenchResult {
+        name: format!("slab alloc-only (free list) {count}x {slot_size}B"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
+fn bench_slab_bump_alloc(count: u32, slot_size: u32) -> BenchResult {
+    let header_size = size_of::<ArenaSlabState>();
+    let arena_size = header_size + (count as usize) * (slot_size as usize) + 4096;
+    let mut buf = vec![0u8; arena_size];
+    let base = buf.as_mut_ptr();
+    let slab = base.cast::<ArenaSlabState>();
+
+    let ops = count as u64;
+    let elapsed = bench(1, || {
+        // Re-init to reset bump watermark each time
+        unsafe {
+            arena_slab_init(slab, arena_size as u64, slot_size);
+            (*slab).bump.watermark = header_size as u64;
+        }
+        for _ in 0..count {
+            let s = unsafe { arena_slab_alloc(slab, base) };
+            std::hint::black_box(s);
+        }
+    });
+
+    BenchResult {
+        name: format!("slab alloc-only (bump path) {count}x {slot_size}B"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
 // ── Main: run all benchmarks ─────────────────────────────────────────
 
 fn main() {
@@ -638,6 +740,21 @@ fn main() {
     for &count in &[100, 500, 1000] {
         bench_btree_iterate(count).print();
         bench_std_btree_iterate(count).print();
+        println!();
+    }
+
+    // ── Slab Allocator ───────────────────────────────────────────
+    println!("Slab Allocator (alloc+free cycle):");
+    for &(count, size) in &[(1000, 32), (1000, 64), (1000, 256), (10000, 64)] {
+        bench_slab_alloc_free_cycle(count, size).print();
+    }
+    println!();
+
+    println!("Slab Allocator (alloc-only comparison):");
+    for &(count, size) in &[(10000, 64), (10000, 256)] {
+        bench_slab_alloc_only(count, size).print();
+        bench_slab_bump_alloc(count, size).print();
+        bench_bump_alloc(count, size as u64).print();
         println!();
     }
 
