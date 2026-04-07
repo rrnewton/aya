@@ -282,18 +282,13 @@ pub fn process_elf_auto_with_vmlinux(
         let access_str = prog_btf
             .compute_access_string(local_type_id, &relo.field_path)?;
 
-        println!(
-            "cargo:warning=RELO #{i}: sec={} struct={} field={} tid={local_type_id} access={access_str}",
-            relo.section, relo.struct_name, relo.field_path
-        );
-
         // Validate: check that the access string indices are in bounds
         // for the local stub types. This catches instruction scanner
         // false positives that map to wrong fields.
         let valid = validate_access_string(&prog_btf, local_type_id, &access_str);
         if !valid {
-            println!(
-                "cargo:warning=CORE-RELO: skipping invalid #{i}: {}.{} type_id={local_type_id} access={access_str} (out of bounds)",
+            eprintln!(
+                "  warning: skipping invalid relocation #{i}: {}.{} access={access_str} (out of bounds)",
                 relo.struct_name, relo.field_path
             );
             continue;
