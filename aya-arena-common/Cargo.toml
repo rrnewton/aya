@@ -1,0 +1,14 @@
+[package]
+name = "aya-arena-common"
+version = "0.1.0"
+description = "Shared #[repr(C)] types for BPF arena data structures, usable from both BPF and userspace"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "aya_arena_common"
+
+[features]
+default = []
+
+[dependencies]
