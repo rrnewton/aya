@@ -282,6 +282,23 @@ pub fn process_elf_auto_with_vmlinux(
         let access_str = prog_btf
             .compute_access_string(local_type_id, &relo.field_path)?;
 
+        println!(
+            "cargo:warning=RELO #{i}: sec={} struct={} field={} tid={local_type_id} access={access_str}",
+            relo.section, relo.struct_name, relo.field_path
+        );
+
+        // Validate: check that the access string indices are in bounds
+        // for the local stub types. This catches instruction scanner
+        // false positives that map to wrong fields.
+        let valid = validate_access_string(&prog_btf, local_type_id, &access_str);
+        if !valid {
+            println!(
+                "cargo:warning=CORE-RELO: skipping invalid #{i}: {}.{} type_id={local_type_id} access={access_str} (out of bounds)",
+                relo.struct_name, relo.field_path
+            );
+            continue;
+        }
+
         writer
             .add_relocation_with_type_id(relo, local_type_id, &access_str)
             .with_context(|| format!("processing auto-discovered relocation #{i}: {relo:?}"))?;
@@ -289,6 +306,38 @@ pub fn process_elf_auto_with_vmlinux(
 
     let (new_btf_data, new_btf_ext_data) = writer.finish(elf_data)?;
     elf_patcher::patch_elf_sections(elf_data, &new_btf_data, &new_btf_ext_data)
+}
+
+/// Validates that an access string's member indices are in bounds
+/// for the local BTF types. Returns false if any index exceeds the
+/// member count, indicating an instruction scanner false positive.
+fn validate_access_string(btf: &BtfInfo, root_type_id: u32, access_str: &str) -> bool {
+    let parts: Vec<usize> = access_str
+        .split(':')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    let mut type_id = root_type_id;
+    // Skip parts[0] (base index, always 0)
+    for &index in parts.iter().skip(1) {
+        let resolved = match btf.resolve_type(type_id) {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+        let ty = match btf.types.get(resolved as usize) {
+            Some(t) => t,
+            None => return false,
+        };
+        let members = match ty {
+            btf_parser::BtfType::Struct(_, m) | btf_parser::BtfType::Union(_, m) => m,
+            _ => return false,
+        };
+        if index >= members.len() {
+            return false;
+        }
+        type_id = members[index].type_id;
+    }
+    true
 }
 
 /// Collects the struct members needed for a given field path.
