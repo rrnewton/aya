@@ -960,7 +960,7 @@ mod tests {
         assert_matches!(
             find_debug_path_in_object(&main_obj, main_path, "symbol"),
             Ok(path) => {
-                assert_eq!(&*path, "/path/to/main.debug", "path: {}", path.display());
+                assert_eq!(&*path, Path::new("/path/to/main.debug"), "path: {}", path.display());
             }
         );
     }
@@ -1177,7 +1177,7 @@ mod tests {
         assert_matches!(
             proc_map_libs.find_library_path_by_name(Path::new("libcrypto.so.3.0.9")),
             Ok(Some(path)) => {
-                assert_eq!(path, "/usr/lib64/libcrypto.so.3.0.9", "path: {}", path.display());
+                assert_eq!(path, Path::new("/usr/lib64/libcrypto.so.3.0.9"), "path: {}", path.display());
             }
         );
     }
@@ -1194,7 +1194,7 @@ mod tests {
         assert_matches!(
             proc_map_libs.find_library_path_by_name(Path::new("libcrypto")),
             Ok(Some(path)) => {
-                assert_eq!(path, "/usr/lib64/libcrypto.so.3.0.9", "path: {}", path.display());
+                assert_eq!(path, Path::new("/usr/lib64/libcrypto.so.3.0.9"), "path: {}", path.display());
             }
         );
     }
@@ -1215,7 +1215,7 @@ mod tests {
         assert_matches!(
             proc_map_libs.find_library_path_by_name(Path::new("ld-linux-x86-64.so.2")),
             Ok(Some(path)) => {
-                assert_eq!(path, "/usr/lib64/ld-linux-x86-64.so.2", "path: {}", path.display());
+                assert_eq!(path, Path::new("/usr/lib64/ld-linux-x86-64.so.2"), "path: {}", path.display());
             }
         );
     }
