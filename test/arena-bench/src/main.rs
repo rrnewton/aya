@@ -5,11 +5,11 @@
 //! memory (process-local buffer), measuring the raw algorithmic cost.
 
 use aya_arena_common::{
-    ArenaHashEntry, ArenaHashMap, ArenaBumpState, ArenaNodeHeader, ArenaPtr,
-    CounterNode, arena_hash_delete, arena_hash_get, arena_hash_init,
-    arena_hash_insert,
+    ArenaBTreeMap, ArenaBumpState, ArenaHashEntry, ArenaHashMap, ArenaNodeHeader, ArenaPtr,
+    BTreeNode, CounterNode, arena_btree_for_each, arena_btree_get, arena_btree_init,
+    arena_btree_insert, arena_hash_delete, arena_hash_get, arena_hash_init, arena_hash_insert,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 // ── Timing helpers ────────────────────────────────────────────────────
@@ -379,6 +379,184 @@ fn bench_bump_alloc(alloc_count: u32, alloc_size: u64) -> BenchResult {
     }
 }
 
+// ── B-tree benchmarks ─────────────────────────────────────────────────
+
+struct BTreeFixture {
+    buf: Vec<u8>,
+    map: *mut ArenaBTreeMap,
+    bump: *mut ArenaBumpState,
+    base: *mut u8,
+}
+
+impl BTreeFixture {
+    fn new() -> Self {
+        let arena_size = 4 * 1024 * 1024; // 4 MiB
+        let mut buf = vec![0u8; arena_size];
+        let base = buf.as_mut_ptr();
+        let map = base.cast::<ArenaBTreeMap>();
+        unsafe { arena_btree_init(map) };
+
+        let bump_offset = size_of::<ArenaBTreeMap>();
+        let bump = unsafe { base.add(bump_offset).cast::<ArenaBumpState>() };
+        let data_start = bump_offset + size_of::<ArenaBumpState>();
+        unsafe {
+            *bump = ArenaBumpState::new((arena_size - data_start) as u64);
+            (*bump).watermark = data_start as u64;
+        }
+        Self {
+            buf,
+            map,
+            bump,
+            base,
+        }
+    }
+
+    fn reset(&mut self) {
+        let arena_size = self.buf.len();
+        self.base = self.buf.as_mut_ptr();
+        self.map = self.base.cast::<ArenaBTreeMap>();
+        unsafe { arena_btree_init(self.map) };
+
+        let bump_offset = size_of::<ArenaBTreeMap>();
+        self.bump = unsafe { self.base.add(bump_offset).cast::<ArenaBumpState>() };
+        let data_start = bump_offset + size_of::<ArenaBumpState>();
+        unsafe {
+            *self.bump = ArenaBumpState::new((arena_size - data_start) as u64);
+            (*self.bump).watermark = data_start as u64;
+        }
+    }
+}
+
+fn bench_btree_insert(count: u32) -> BenchResult {
+    let mut fix = BTreeFixture::new();
+    let ops = count as u64;
+
+    let elapsed = bench(1, || {
+        fix.reset();
+        for i in 0..count {
+            unsafe {
+                arena_btree_insert(fix.map, fix.bump, (i as u64) * 7 + 1, i as u64, fix.base);
+            }
+        }
+    });
+
+    BenchResult {
+        name: format!("arena btree insert {count}"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
+fn bench_std_btree_insert(count: u32) -> BenchResult {
+    let ops = count as u64;
+
+    let elapsed = bench(1, || {
+        let mut map = BTreeMap::new();
+        for i in 0..count {
+            map.insert((i as u64) * 7 + 1, i as u64);
+        }
+        std::hint::black_box(&map);
+    });
+
+    BenchResult {
+        name: format!("std btree insert {count}"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
+fn bench_btree_lookup(count: u32) -> BenchResult {
+    let mut fix = BTreeFixture::new();
+    for i in 0..count {
+        unsafe {
+            arena_btree_insert(fix.map, fix.bump, (i as u64) * 7 + 1, i as u64, fix.base);
+        }
+    }
+
+    let ops = count as u64;
+    let elapsed = bench(1, || {
+        for i in 0..count {
+            let v = unsafe { arena_btree_get(fix.map, (i as u64) * 7 + 1, fix.base) };
+            std::hint::black_box(v);
+        }
+    });
+
+    BenchResult {
+        name: format!("arena btree lookup {count}"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
+fn bench_std_btree_lookup(count: u32) -> BenchResult {
+    let mut map = BTreeMap::new();
+    for i in 0..count {
+        map.insert((i as u64) * 7 + 1, i as u64);
+    }
+
+    let ops = count as u64;
+    let elapsed = bench(1, || {
+        for i in 0..count {
+            let v = map.get(&((i as u64) * 7 + 1));
+            std::hint::black_box(v);
+        }
+    });
+
+    BenchResult {
+        name: format!("std btree lookup {count}"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
+fn bench_btree_iterate(count: u32) -> BenchResult {
+    let mut fix = BTreeFixture::new();
+    for i in 0..count {
+        unsafe {
+            arena_btree_insert(fix.map, fix.bump, (i as u64) * 7 + 1, i as u64, fix.base);
+        }
+    }
+
+    let ops = count as u64;
+    let elapsed = bench(1, || {
+        let mut sum: u64 = 0;
+        unsafe {
+            arena_btree_for_each(fix.map, fix.base, |_k, v| {
+                sum += v;
+            });
+        }
+        std::hint::black_box(sum);
+    });
+
+    BenchResult {
+        name: format!("arena btree iterate {count}"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
+fn bench_std_btree_iterate(count: u32) -> BenchResult {
+    let mut map = BTreeMap::new();
+    for i in 0..count {
+        map.insert((i as u64) * 7 + 1, i as u64);
+    }
+
+    let ops = count as u64;
+    let elapsed = bench(1, || {
+        let mut sum: u64 = 0;
+        for (_k, &v) in &map {
+            sum += v;
+        }
+        std::hint::black_box(sum);
+    });
+
+    BenchResult {
+        name: format!("std btree iterate {count}"),
+        ops,
+        elapsed_ns: elapsed,
+    }
+}
+
 // ── Main: run all benchmarks ─────────────────────────────────────────
 
 fn main() {
@@ -440,6 +618,28 @@ fn main() {
         bench_bump_alloc(count, size).print();
     }
     println!();
+
+    // ── B-tree vs std::BTreeMap ──────────────────────────────────
+    println!("B-Tree Insert:");
+    for &count in &[100, 500, 1000] {
+        bench_btree_insert(count).print();
+        bench_std_btree_insert(count).print();
+        println!();
+    }
+
+    println!("B-Tree Lookup:");
+    for &count in &[100, 500, 1000] {
+        bench_btree_lookup(count).print();
+        bench_std_btree_lookup(count).print();
+        println!();
+    }
+
+    println!("B-Tree Ordered Iteration:");
+    for &count in &[100, 500, 1000] {
+        bench_btree_iterate(count).print();
+        bench_std_btree_iterate(count).print();
+        println!();
+    }
 
     // ── Summary ───────────────────────────────────────────────────
     println!("Notes:");
