@@ -332,10 +332,8 @@ fn relocate_btf_functions<'target>(
             let candidates = if let Some(cands) = candidates_cache.get(&rel.type_id) {
                 cands
             } else {
-                candidates_cache.insert(
-                    rel.type_id,
-                    find_candidates(local_ty, local_name, target_btf)?,
-                );
+                let cands = find_candidates(local_ty, local_name, target_btf)?;
+                candidates_cache.insert(rel.type_id, cands);
                 candidates_cache.get(&rel.type_id).unwrap()
             };
 
