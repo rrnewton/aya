@@ -346,8 +346,10 @@ impl ArenaHashMap {
 ///
 /// `header_ptr` must point to space for an `ArenaHashMap`.
 /// `entries_ptr` must point to space for `capacity` `ArenaHashEntry` slots.
-/// `capacity` must be a power of 2.
+/// `capacity` must be a power of 2 and > 0.
 /// `arena_base` is the base address of the arena (for computing offsets).
+///
+/// Returns -1 if capacity is 0 or not a power of 2.
 ///
 /// # Safety
 ///
@@ -358,7 +360,12 @@ pub unsafe fn arena_hash_init(
     entries_ptr: *mut ArenaHashEntry,
     capacity: u32,
     arena_base: *mut u8,
-) {
+) -> i32 {
+    // Validate capacity is a power of 2 and non-zero
+    if capacity == 0 || (capacity & (capacity - 1)) != 0 {
+        return -1;
+    }
+
     // Zero-initialize all entries
     let mut i: u32 = 0;
     while i < capacity {
@@ -378,6 +385,8 @@ pub unsafe fn arena_hash_init(
             entries: ArenaPtr::from_raw(entries_ptr, arena_base),
         },
     );
+
+    0
 }
 
 /// Insert a key-value pair into the hash map.
@@ -451,10 +460,12 @@ pub unsafe fn arena_hash_insert(
         probe += 1;
     }
 
-    // If we found a tombstone but no empty slot and no matching key,
-    // we can still insert there (the key is definitely not in the map
-    // if we exhausted max_probes).
-    if first_tombstone >= 0 {
+    // If we found a tombstone but no empty slot and no matching key:
+    // We can only safely insert into the tombstone if we searched the
+    // ENTIRE table (max_probes >= capacity), guaranteeing the key is
+    // not present elsewhere. Otherwise, inserting would create a
+    // duplicate if the key exists beyond our probe window.
+    if first_tombstone >= 0 && max_probes >= header.capacity {
         let target = &mut *entries.add(first_tombstone as usize);
         target.key = key;
         target.value = value;
@@ -700,7 +711,8 @@ mod tests {
         let base = buf.as_mut_ptr();
         let header_ptr = base.cast::<ArenaHashMap>();
         let entries_ptr = unsafe { base.add(header_size) }.cast::<ArenaHashEntry>();
-        unsafe { arena_hash_init(header_ptr, entries_ptr, capacity, base) };
+        let ret = unsafe { arena_hash_init(header_ptr, entries_ptr, capacity, base) };
+        assert_eq!(ret, 0, "arena_hash_init failed");
         (buf, header_ptr)
     }
 
@@ -936,5 +948,65 @@ mod tests {
             hit_count > 150,
             "poor hash distribution: only {hit_count}/256 buckets hit"
         );
+    }
+
+    #[test]
+    fn hash_map_init_rejects_non_power_of_2() {
+        let mut buf = vec![0u8; 1024];
+        let base = buf.as_mut_ptr();
+        let header = base.cast::<ArenaHashMap>();
+        let entries = unsafe { base.add(size_of::<ArenaHashMap>()) }.cast::<ArenaHashEntry>();
+
+        // capacity=0 should fail
+        assert_eq!(unsafe { arena_hash_init(header, entries, 0, base) }, -1);
+        // capacity=3 (not power of 2) should fail
+        assert_eq!(unsafe { arena_hash_init(header, entries, 3, base) }, -1);
+        // capacity=5 should fail
+        assert_eq!(unsafe { arena_hash_init(header, entries, 5, base) }, -1);
+        // capacity=1 should succeed (edge: power of 2)
+        assert_eq!(unsafe { arena_hash_init(header, entries, 1, base) }, 0);
+        // capacity=4 should succeed
+        assert_eq!(unsafe { arena_hash_init(header, entries, 4, base) }, 0);
+    }
+
+    #[test]
+    fn hash_map_capacity_1() {
+        // Edge case: hash map with capacity 1
+        let (mut buf, map) = make_hash_map(1);
+        let base = buf.as_mut_ptr();
+
+        // Insert one entry
+        assert_eq!(unsafe { arena_hash_insert(map, 42, 100, base) }, 0);
+        assert_eq!(unsafe { *arena_hash_get(map, 42, base) }, 100);
+
+        // Second insert should fail (full)
+        assert_eq!(unsafe { arena_hash_insert(map, 99, 200, base) }, -1);
+
+        // Delete and reinsert
+        assert_eq!(unsafe { arena_hash_delete(map, 42, base) }, 0);
+        assert_eq!(unsafe { arena_hash_insert(map, 99, 200, base) }, 0);
+        assert_eq!(unsafe { *arena_hash_get(map, 99, base) }, 200);
+    }
+
+    #[test]
+    fn hash_map_key_zero() {
+        // Edge case: key 0 should work (not confused with empty)
+        let (mut buf, map) = make_hash_map(16);
+        let base = buf.as_mut_ptr();
+
+        assert_eq!(unsafe { arena_hash_insert(map, 0, 999, base) }, 0);
+        let val = unsafe { arena_hash_get(map, 0, base) };
+        assert!(!val.is_null());
+        assert_eq!(unsafe { *val }, 999);
+    }
+
+    #[test]
+    fn hash_map_key_u64_max() {
+        // Edge case: u64::MAX key
+        let (mut buf, map) = make_hash_map(16);
+        let base = buf.as_mut_ptr();
+
+        assert_eq!(unsafe { arena_hash_insert(map, u64::MAX, 42, base) }, 0);
+        assert_eq!(unsafe { *arena_hash_get(map, u64::MAX, base) }, 42);
     }
 }
