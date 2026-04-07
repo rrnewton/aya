@@ -57,8 +57,9 @@ pub struct BtfExtWriter<'a> {
     existing_ext_data: Option<Vec<u8>>,
     /// New CO-RE relocation records grouped by section name.
     new_relos: Vec<(String, Vec<CoreReloRecord>)>,
-    /// Strings added to BTF for access strings and section names.
-    added_strings: Vec<(String, u32)>,
+    /// Access strings indexed by (access_str, section_index, record_index).
+    /// This ensures correct assignment even when records are grouped by section.
+    added_strings: Vec<(String, u32, u32)>,
 }
 
 impl<'a> BtfExtWriter<'a> {
@@ -117,9 +118,12 @@ impl<'a> BtfExtWriter<'a> {
                 .push((entry.section.clone(), vec![record]));
         }
 
-        // Remember the access string for later string table addition.
+        // Store access string with its record's location for correct
+        // assignment during finish().
+        let sec_idx = self.new_relos.iter().position(|(s, _)| s == &entry.section).unwrap();
+        let rec_idx = self.new_relos[sec_idx].1.len() - 1;
         self.added_strings
-            .push((access_str, 0 /* placeholder */));
+            .push((access_str, sec_idx as u32, rec_idx as u32));
 
         Ok(())
     }
@@ -135,12 +139,6 @@ impl<'a> BtfExtWriter<'a> {
         type_id: u32,
         access_str: &str,
     ) -> Result<()> {
-        eprintln!(
-            "  relo: section={} insn={} type={}(id={}) path={} -> access_str={}",
-            entry.section, entry.insn_index, entry.struct_name, type_id, entry.field_path,
-            access_str
-        );
-
         let record = CoreReloRecord {
             insn_off: entry.insn_index * BPF_INSN_SIZE,
             type_id,
@@ -157,9 +155,13 @@ impl<'a> BtfExtWriter<'a> {
                 .push((entry.section.clone(), vec![record]));
         }
 
-        // Remember the access string for later string table addition.
+        // Store the access string alongside its record, indexed by
+        // (section_index, record_index_within_section) so that finish()
+        // can assign offsets in the correct order after grouping.
+        let sec_idx = self.new_relos.iter().position(|(s, _)| s == &entry.section).unwrap();
+        let rec_idx = self.new_relos[sec_idx].1.len() - 1;
         self.added_strings
-            .push((access_str.to_string(), 0 /* placeholder */));
+            .push((access_str.to_string(), sec_idx as u32, rec_idx as u32));
 
         Ok(())
     }
@@ -176,10 +178,11 @@ impl<'a> BtfExtWriter<'a> {
         let mut btf = self.btf.clone();
 
         // Add all access strings to the BTF string table and record their offsets.
-        let mut access_str_offsets = Vec::new();
-        for (access_str, _) in &self.added_strings {
+        // Each entry is (access_str, section_index, record_index_in_section).
+        for (access_str, sec_idx, rec_idx) in &self.added_strings {
             let off = btf.add_string(access_str);
-            access_str_offsets.push(off);
+            // Directly assign the string offset to the correct record.
+            self.new_relos[*sec_idx as usize].1[*rec_idx as usize].access_str_off = off;
         }
 
         // Add section names to the BTF string table.
@@ -189,14 +192,7 @@ impl<'a> BtfExtWriter<'a> {
             section_name_offsets.push(off);
         }
 
-        // Now fill in the access_str_off in the relocation records.
-        let mut str_idx = 0;
-        for (_, records) in &mut self.new_relos {
-            for record in records.iter_mut() {
-                record.access_str_off = access_str_offsets[str_idx];
-                str_idx += 1;
-            }
-        }
+        // access_str_off was already assigned above per-record.
 
         // Build SectionRelos from the grouped records.
         let section_relos: Vec<SectionRelos> = self
