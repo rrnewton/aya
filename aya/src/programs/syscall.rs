@@ -50,6 +50,7 @@ impl SyscallProgram {
 
     /// Loads the program inside the kernel.
     pub fn load(&mut self) -> Result<(), ProgramError> {
+        self.data.flags = aya_obj::generated::BPF_F_SLEEPABLE;
         load_program(BPF_PROG_TYPE_SYSCALL, &mut self.data)
     }
 
