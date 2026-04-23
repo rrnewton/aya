@@ -16,9 +16,9 @@ use aya_arena_common::{
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
     kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
-    macros::{btf_map, map, socket_filter},
+    macros::{btf_map, lsm, map},
     maps::Array,
-    programs::SkBuffContext,
+    programs::LsmContext,
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -199,21 +199,21 @@ unsafe fn run_btree_test(arena_ptr: *mut c_void) -> i64 {
 
 // ── BPF program entry point ────────────────────────────────────────────
 
-#[socket_filter]
-fn arena_btree_test(_ctx: SkBuffContext) -> i64 {
+#[lsm(hook = "socket_create", sleepable)]
+fn arena_btree_test(_ctx: LsmContext) -> i32 {
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };
     if initialized != 0 {
         return 0;
     }
 
     let arena_ptr = ARENA.as_ptr();
-    let ret = unsafe { run_btree_test(arena_ptr) };
+    let _ret = unsafe { run_btree_test(arena_ptr) };
 
-    if ret == 0 {
-        unsafe {
-            core::ptr::write_volatile(&raw mut INITIALIZED, 1);
-        }
+    // Always allow socket creation, even if test failed.
+    // Results are communicated via the RESULTS array map.
+    unsafe {
+        core::ptr::write_volatile(&raw mut INITIALIZED, 1);
     }
 
-    ret
+    0
 }

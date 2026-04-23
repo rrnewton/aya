@@ -3,7 +3,7 @@
 //! This BPF program demonstrates the full arena stack:
 //!   arena map → bump allocator → shared types → linked list → cross-boundary access
 //!
-//! The socket_filter builds a heterogeneous linked list in arena memory using
+//! The LSM hook builds a heterogeneous linked list in arena memory using
 //! CounterNode and LabelNode types. The list head is stored at offset 0 in the
 //! arena so userspace can find it.
 //!
@@ -20,8 +20,8 @@ use aya_arena_common::{
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
     kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
-    macros::{btf_map, socket_filter},
-    programs::SkBuffContext,
+    macros::{btf_map, lsm},
+    programs::LsmContext,
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -221,22 +221,21 @@ unsafe fn build_list(arena_ptr: *mut c_void) -> i64 {
 
 // ── BPF program entry point ────────────────────────────────────────────
 
-#[socket_filter]
-fn arena_bump_test(_ctx: SkBuffContext) -> i64 {
-    // Only build the list once (on first packet)
+#[lsm(hook = "socket_create", sleepable)]
+fn arena_bump_test(_ctx: LsmContext) -> i32 {
+    // Only build the list once
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };
     if initialized != 0 {
-        return 0; // Already built, pass the packet
+        return 0;
     }
 
     let arena_ptr = ARENA.as_ptr();
-    let ret = unsafe { build_list(arena_ptr) };
+    let _ret = unsafe { build_list(arena_ptr) };
 
-    if ret == 0 {
-        unsafe {
-            core::ptr::write_volatile(&raw mut INITIALIZED, 1);
-        }
+    // Always allow socket creation, even if test failed.
+    unsafe {
+        core::ptr::write_volatile(&raw mut INITIALIZED, 1);
     }
 
-    ret
+    0
 }
