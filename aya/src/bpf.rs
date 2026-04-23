@@ -566,6 +566,9 @@ impl<'a> EbpfLoader<'a> {
                 }
             };
             map.finalize()?;
+            if map_type == bpf_map_type::BPF_MAP_TYPE_ARENA {
+                map.mmap_arena()?;
+            }
             maps.insert(name, map);
         }
 

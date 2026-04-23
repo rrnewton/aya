@@ -438,7 +438,7 @@ pub(crate) fn bytes_of_bpf_name(bpf_name: &[core::ffi::c_char; 16]) -> &[u8] {
 // MMap corresponds to a memory-mapped region.
 //
 // The data is unmapped in Drop.
-#[cfg_attr(test, derive(Debug))]
+#[derive(Debug)]
 pub(crate) struct MMap {
     ptr: ptr::NonNull<c_void>,
     len: usize,

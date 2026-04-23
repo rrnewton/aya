@@ -605,6 +605,7 @@ pub(crate) const fn check_v_size<V>(map: &MapData) -> Result<(), MapError> {
 pub struct MapData {
     obj: aya_obj::Map,
     fd: MapFd,
+    arena_mmap: Option<crate::util::MMap>,
 }
 
 impl MapData {
@@ -643,6 +644,7 @@ impl MapData {
         Ok(Self {
             obj,
             fd: MapFd::from_fd(fd),
+            arena_mmap: None,
         })
     }
 
@@ -672,6 +674,7 @@ impl MapData {
             Ok(Self {
                 obj,
                 fd: MapFd::from_fd(fd),
+                arena_mmap: None,
             })
         } else {
             let map = Self::create(obj, name, btf_fd)?;
@@ -684,7 +687,7 @@ impl MapData {
     }
 
     pub(crate) fn finalize(&mut self) -> Result<(), MapError> {
-        let Self { obj, fd } = self;
+        let Self { obj, fd, arena_mmap: _ } = self;
         if !obj.data().is_empty() {
             bpf_map_update_elem_ptr(fd.as_fd(), &0, obj.data_mut().as_mut_ptr(), 0)
                 .map_err(|io_error| SyscallError {
@@ -701,6 +704,26 @@ impl MapData {
                 })
                 .map_err(MapError::from)?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn mmap_arena(&mut self) -> Result<(), MapError> {
+        use std::os::fd::AsFd as _;
+
+        let max_entries = self.obj.max_entries();
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let mmap_size = max_entries as usize * page_size;
+        if mmap_size == 0 {
+            return Ok(());
+        }
+        let mmap = crate::util::MMap::new(
+            self.fd.as_fd(),
+            mmap_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            0,
+        )?;
+        self.arena_mmap = Some(mmap);
         Ok(())
     }
 
@@ -737,6 +760,7 @@ impl MapData {
         Ok(Self {
             obj: parse_map_info(info, PinningType::None),
             fd: MapFd::from_fd(fd),
+            arena_mmap: None,
         })
     }
 
@@ -777,7 +801,7 @@ impl MapData {
     pub fn pin<P: AsRef<Path>>(&self, path: P) -> Result<(), PinError> {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let Self { fd, obj: _ } = self;
+        let Self { fd, obj: _, arena_mmap: _ } = self;
         let path = path.as_ref();
         let path_string = CString::new(path.as_os_str().as_bytes()).map_err(|error| {
             PinError::InvalidPinPath {
@@ -794,12 +818,12 @@ impl MapData {
 
     /// Returns the file descriptor of the map.
     pub const fn fd(&self) -> &MapFd {
-        let Self { obj: _, fd } = self;
+        let Self { obj: _, fd, arena_mmap: _ } = self;
         fd
     }
 
     pub(crate) const fn obj(&self) -> &aya_obj::Map {
-        let Self { obj, fd: _ } = self;
+        let Self { obj, fd: _, arena_mmap: _ } = self;
         obj
     }
 
