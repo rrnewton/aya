@@ -146,6 +146,22 @@ name = "arena_test"
 path = "src/arena_test.rs"
 
 [[bin]]
+name = "arena_cross_test"
+path = "src/arena_cross_test.rs"
+
+[[bin]]
+name = "arena_hashmap_test"
+path = "src/arena_hashmap_test.rs"
+
+[[bin]]
+name = "arena_slab_test"
+path = "src/arena_slab_test.rs"
+
+[[bin]]
+name = "arena_btree_test"
+path = "src/arena_btree_test.rs"
+
+[[bin]]
 name = "printk_test"
 path = "src/printk_test.rs"
 

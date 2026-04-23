@@ -18,6 +18,7 @@ aya = { path = "../../aya", version = "^0.13.2", default-features = false }
 
 [dev-dependencies]
 anyhow = { workspace = true, features = ["std"] }
+aya-arena-common = { path = "../../aya-arena-common" }
 assert_matches = { workspace = true }
 aya-log = { path = "../../aya-log", version = "^0.2.2", default-features = false }
 aya-obj = { path = "../../aya-obj", version = "^0.2.2", default-features = false }

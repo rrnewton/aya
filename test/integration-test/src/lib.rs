@@ -39,6 +39,10 @@ bpf_file!(
     TEXT_64_64_RELOC => "text_64_64_reloc.o",
     VARIABLES_RELOC => "variables_reloc.bpf.o",
 
+    ARENA_BTREE_TEST => "arena_btree_test",
+    ARENA_CROSS_TEST => "arena_cross_test",
+    ARENA_HASHMAP_TEST => "arena_hashmap_test",
+    ARENA_SLAB_TEST => "arena_slab_test",
     ARRAY => "array",
     BLOOM_FILTER => "bloom_filter",
     BPF_PROBE_READ => "bpf_probe_read",
