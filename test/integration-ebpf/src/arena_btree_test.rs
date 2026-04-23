@@ -199,7 +199,7 @@ unsafe fn run_btree_test(arena_ptr: *mut c_void) -> i64 {
 
 // ── BPF program entry point ────────────────────────────────────────────
 
-#[fentry(function = "do_nanosleep", sleepable)]
+#[fentry(function = "hrtimer_nanosleep", sleepable)]
 fn arena_btree_test(_ctx: FEntryContext) -> i32 {
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };
     if initialized != 0 {

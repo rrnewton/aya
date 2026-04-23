@@ -345,7 +345,7 @@ unsafe fn run_cross_test(arena_ptr: *mut c_void) -> i64 {
     0
 }
 
-#[fentry(function = "do_nanosleep", sleepable)]
+#[fentry(function = "hrtimer_nanosleep", sleepable)]
 fn arena_cross_test(_ctx: FEntryContext) -> i32 {
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };
     if initialized != 0 {

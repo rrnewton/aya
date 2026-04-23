@@ -221,7 +221,7 @@ unsafe fn build_list(arena_ptr: *mut c_void) -> i64 {
 
 // ── BPF program entry point ────────────────────────────────────────────
 
-#[fentry(function = "do_nanosleep", sleepable)]
+#[fentry(function = "hrtimer_nanosleep", sleepable)]
 fn arena_bump_test(_ctx: FEntryContext) -> i32 {
     // Only build the list once
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };

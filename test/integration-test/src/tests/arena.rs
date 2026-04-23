@@ -27,7 +27,7 @@ fn load_and_trigger(bpf_bytes: &[u8], prog_name: &str) -> Ebpf {
         .unwrap()
         .try_into()
         .unwrap();
-    prog.load("do_nanosleep", &btf).unwrap();
+    prog.load("hrtimer_nanosleep", &btf).unwrap();
     prog.attach().unwrap();
 
     // Trigger the fentry hook by sleeping.
