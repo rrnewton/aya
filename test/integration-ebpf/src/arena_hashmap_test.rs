@@ -175,7 +175,7 @@ unsafe fn run_hashmap_test(arena_ptr: *mut c_void) -> i64 {
 
 // ── BPF program entry point ────────────────────────────────────────────
 
-#[fentry(function = "hrtimer_nanosleep", sleepable)]
+#[fentry(function = "__x64_sys_nanosleep", sleepable)]
 fn arena_hashmap_test(_ctx: FEntryContext) -> i32 {
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };
     if initialized != 0 {
