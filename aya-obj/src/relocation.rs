@@ -355,6 +355,7 @@ impl<'a> FunctionLinker<'a> {
         for ins_index in start_ins..start_ins + n_instructions {
             let ins = program.instructions[ins_index];
             let is_call = insn_is_call(ins);
+            let is_call_insn = insn_is_call_opcode(ins);
 
             // Look up the raw relocation for this instruction
             let raw_rel = relocations.and_then(|relocations| {
@@ -365,7 +366,12 @@ impl<'a> FunctionLinker<'a> {
             // Check if this is a call to an extern/undefined symbol (e.g. kfunc).
             // Patch these from BPF_PSEUDO_CALL to BPF_PSEUDO_KFUNC_CALL so the
             // kernel verifier resolves them against vmlinux BTF.
-            if is_call {
+            //
+            // Two cases:
+            // 1. Normal extern function call: src_reg=1 (BPF_PSEUDO_CALL)
+            // 2. Inline asm `call {sym}`: src_reg=0 (raw call opcode)
+            // Both need patching if the relocation target is an undefined extern.
+            if is_call || is_call_insn {
                 if let Some(rel) = raw_rel {
                     if let Some(sym) = self.symbol_table.get(&rel.symbol_index) {
                         if !sym.is_definition && sym.section_index.is_none() {
@@ -518,6 +524,17 @@ fn insn_is_call(ins: bpf_insn) -> bool {
         && u32::from(ins.src_reg()) == BPF_PSEUDO_CALL
         && ins.dst_reg() == 0
         && ins.off == 0
+}
+
+/// Checks if the instruction is a BPF call opcode (any src_reg).
+/// Used to detect inline-asm kfunc calls which have src_reg=0 instead
+/// of BPF_PSEUDO_CALL.
+fn insn_is_call_opcode(ins: bpf_insn) -> bool {
+    let klass = u32::from(ins.code & 0x07);
+    let op = u32::from(ins.code & 0xF0);
+    let src = u32::from(ins.code & 0x08);
+
+    klass == BPF_JMP && op == BPF_CALL && src == BPF_K && ins.dst_reg() == 0 && ins.off == 0
 }
 
 #[cfg(test)]
