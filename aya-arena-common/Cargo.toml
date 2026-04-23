@@ -12,3 +12,6 @@ name = "aya_arena_common"
 default = []
 
 [dependencies]
+
+[dev-dependencies]
+proptest = "1"
