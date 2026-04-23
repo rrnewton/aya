@@ -62,6 +62,12 @@ pub(crate) fn bpf_create_map(
     u.map_flags = def.map_flags();
     u.map_extra = def.map_extra();
 
+    // Arena maps require key_size=0 and value_size=0.
+    if let Ok(bpf_map_type::BPF_MAP_TYPE_ARENA) = u.map_type.try_into() {
+        u.key_size = 0;
+        u.value_size = 0;
+    }
+
     if let aya_obj::Map::Btf(m) = def {
         // Mimic https://github.com/libbpf/libbpf/issues/355
         // Currently a bunch of (usually pretty specialized) BPF maps do not support
