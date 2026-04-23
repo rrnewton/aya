@@ -301,6 +301,7 @@ pub enum ProgramSection {
     StructOps {
         sleepable: bool,
     },
+    Syscall,
 }
 
 impl FromStr for ProgramSection {
@@ -472,6 +473,7 @@ impl FromStr for ProgramSection {
             "iter.s" => Self::Iter { sleepable: true },
             "struct_ops" => Self::StructOps { sleepable: false },
             "struct_ops.s" => Self::StructOps { sleepable: true },
+            "syscall" => Self::Syscall,
             _ => {
                 return Err(ParseError::InvalidProgramSection {
                     section: section.to_owned(),

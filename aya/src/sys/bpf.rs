@@ -1258,6 +1258,13 @@ pub(super) fn unit_sys_bpf(cmd: bpf_cmd, attr: &mut bpf_attr) -> io::Result<()> 
     sys_bpf(cmd, attr).map(|code| assert_eq!(code, 0))
 }
 
+pub(crate) fn bpf_prog_test_run(prog_fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+    unsafe { attr.test.prog_fd = prog_fd.as_raw_fd() as u32 };
+    sys_bpf(bpf_cmd::BPF_PROG_TEST_RUN, &mut attr)?;
+    Ok(unsafe { attr.test.retval })
+}
+
 fn bpf_obj_get_next_id(
     id: u32,
     cmd: bpf_cmd,

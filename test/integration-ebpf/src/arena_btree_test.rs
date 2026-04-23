@@ -16,9 +16,9 @@ use aya_arena_common::{
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
     kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
-    macros::{btf_map, fentry, map},
+    macros::{btf_map, map},
     maps::Array,
-    programs::FEntryContext,
+    
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -199,8 +199,9 @@ unsafe fn run_btree_test(arena_ptr: *mut c_void) -> i64 {
 
 // ── BPF program entry point ────────────────────────────────────────────
 
-#[fentry(function = "__x64_sys_nanosleep", sleepable)]
-fn arena_btree_test(_ctx: FEntryContext) -> i32 {
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "syscall")]
+fn arena_btree_test(_ctx: *mut c_void) -> i32 {
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };
     if initialized != 0 {
         return 0;

@@ -1,6 +1,4 @@
-use std::{net::UdpSocket, thread, time::Duration};
-
-use aya::{Btf, Ebpf, maps::Array, maps::arena::Arena, programs::FEntry, util::KernelVersion};
+use aya::{Ebpf, maps::Array, maps::arena::Arena, programs::SyscallProgram, util::KernelVersion};
 use aya_arena_common::{
     ArenaListHead, ArenaNodeHeader, ArenaPtr, CounterNode, LabelNode, TAG_COUNTER, TAG_LABEL,
     arena_hash_for_each, arena_hash_get, arena_btree_get, arena_btree_for_each,
@@ -16,22 +14,18 @@ fn skip_if_no_arena() -> bool {
     false
 }
 
-/// Load an fentry(sleepable) BPF program, attach it, trigger by sleeping,
+/// Load a BPF_PROG_TYPE_SYSCALL program, invoke it via test_run,
 /// and return the Ebpf instance for assertion.
 fn load_and_trigger(bpf_bytes: &[u8], prog_name: &str) -> Ebpf {
     let mut bpf = Ebpf::load(bpf_bytes).unwrap();
 
-    let btf = Btf::from_sys_fs().unwrap();
-    let prog: &mut FEntry = bpf
+    let prog: &mut SyscallProgram = bpf
         .program_mut(prog_name)
         .unwrap()
         .try_into()
         .unwrap();
-    prog.load("__x64_sys_nanosleep", &btf).unwrap();
-    prog.attach().unwrap();
-
-    // Trigger the fentry hook by sleeping.
-    thread::sleep(Duration::from_millis(10));
+    prog.load().unwrap();
+    prog.test_run().unwrap();
 
     bpf
 }
