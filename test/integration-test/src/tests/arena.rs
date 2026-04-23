@@ -1,6 +1,6 @@
-use std::net::UdpSocket;
+use std::{net::UdpSocket, thread, time::Duration};
 
-use aya::{Btf, Ebpf, maps::Array, maps::arena::Arena, programs::Lsm, util::KernelVersion};
+use aya::{Btf, Ebpf, maps::Array, maps::arena::Arena, programs::FEntry, util::KernelVersion};
 use aya_arena_common::{
     ArenaListHead, ArenaNodeHeader, ArenaPtr, CounterNode, LabelNode, TAG_COUNTER, TAG_LABEL,
     arena_hash_for_each, arena_hash_get, arena_btree_get, arena_btree_for_each,
@@ -16,25 +16,22 @@ fn skip_if_no_arena() -> bool {
     false
 }
 
-/// Load an LSM BPF program, attach it, create a socket to trigger the hook,
+/// Load an fentry(sleepable) BPF program, attach it, trigger by sleeping,
 /// and return the Ebpf instance for assertion.
 fn load_and_trigger(bpf_bytes: &[u8], prog_name: &str) -> Ebpf {
     let mut bpf = Ebpf::load(bpf_bytes).unwrap();
 
     let btf = Btf::from_sys_fs().unwrap();
-    let prog: &mut Lsm = bpf
+    let prog: &mut FEntry = bpf
         .program_mut(prog_name)
         .unwrap()
         .try_into()
         .unwrap();
-    prog.load("socket_create", &btf).unwrap();
+    prog.load("do_nanosleep", &btf).unwrap();
     prog.attach().unwrap();
 
-    // Creating a socket triggers the LSM socket_create hook.
-    let _sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-
-    // Small delay for BPF program to complete.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Trigger the fentry hook by sleeping.
+    thread::sleep(Duration::from_millis(10));
 
     bpf
 }

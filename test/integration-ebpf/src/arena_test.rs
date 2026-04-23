@@ -20,8 +20,8 @@ use aya_arena_common::{
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
     kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
-    macros::{btf_map, lsm},
-    programs::LsmContext,
+    macros::{btf_map, fentry},
+    programs::FEntryContext,
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -221,8 +221,8 @@ unsafe fn build_list(arena_ptr: *mut c_void) -> i64 {
 
 // ── BPF program entry point ────────────────────────────────────────────
 
-#[lsm(hook = "socket_create", sleepable)]
-fn arena_bump_test(_ctx: LsmContext) -> i32 {
+#[fentry(function = "do_nanosleep", sleepable)]
+fn arena_bump_test(_ctx: FEntryContext) -> i32 {
     // Only build the list once
     let initialized = unsafe { core::ptr::read_volatile(&raw const INITIALIZED) };
     if initialized != 0 {
