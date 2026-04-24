@@ -183,7 +183,7 @@ fn arena_hashmap_test(_ctx: *mut c_void) -> i32 {
         return 0;
     }
 
-    let arena_ptr = core::hint::black_box(ARENA.as_ptr());
+    let arena_ptr = ARENA.as_ptr();
     let _ret = unsafe { run_hashmap_test(arena_ptr) };
 
     // Always allow socket creation, even if test failed.

@@ -161,15 +161,10 @@ pub unsafe fn bump_init(
 #[inline(always)]
 pub unsafe fn bump_alloc(
     bump: *mut BumpAllocator,
-    arena_map: *mut c_void,
+    _arena_map: *mut c_void,
     bytes: u64,
     alignment: u64,
 ) -> *mut c_void {
-    // Prevent the compiler from using arena_map for address computations.
-    // arena_map is a map descriptor pointer (map_ptr), and the BPF verifier
-    // prohibits pointer arithmetic on it. Only arena_alloc_pages should use it.
-    let arena_map = core::hint::black_box(arena_map);
-
     // Read current state with volatile to prevent reordering.
     // Re-apply cast_kern after loading the stored arena pointer — the verifier
     // loses the arena type when values are stored in .data/.bss and read back.
@@ -200,52 +195,9 @@ pub unsafe fn bump_alloc(
         return result;
     }
 
-    // Slow path: need a new block.
-    if max_contig == 0 {
-        return ptr::null_mut(); // Not initialized.
-    }
-
-    if cur + max_contig > lim {
-        return ptr::null_mut(); // Memory limit exceeded.
-    }
-
-    #[expect(clippy::cast_possible_truncation, reason = "max_contig_bytes fits in u32 pages")]
-    let alloc_pages = (max_contig / PAGE_SIZE) as u32;
-    let new_memory = arena_alloc_pages(arena_map, ptr::null_mut(), alloc_pages, NUMA_NO_NODE, 0);
-    if new_memory.is_null() {
-        return ptr::null_mut();
-    }
-
-    // Link the new block to the old one (for destroy).
-    let new_link = new_memory.cast::<BlockLink>();
-    unsafe {
-        ptr::write_volatile(&raw mut (*new_link).next, memory.cast::<BlockLink>());
-    }
-
-    let link_size = size_of::<BlockLink>() as u64;
-    let new_base = unsafe { (new_memory as *mut u8).add(link_size as usize) };
-    let new_padding = {
-        let new_addr = new_base as u64;
-        round_up(new_addr, alignment) - new_addr
-    };
-    let new_alloc_bytes = bytes + new_padding;
-
-    if new_alloc_bytes + link_size > max_contig {
-        // Allocation is too large even for a fresh block.
-        arena_free_pages(arena_map, new_memory, alloc_pages);
-        return ptr::null_mut();
-    }
-
-    let result = unsafe { new_base.add(new_padding as usize) as *mut c_void };
-    let result = cast_kern(result);
-
-    unsafe {
-        ptr::write_volatile(&raw mut (*bump).memory, new_memory);
-        ptr::write_volatile(&raw mut (*bump).off, link_size + new_alloc_bytes);
-        ptr::write_volatile(&raw mut (*bump).cur_memusage, cur + max_contig);
-    }
-
-    result
+    // Slow path: current block exhausted. Return null.
+    // Callers should pre-allocate sufficient pages via bump_init().
+    ptr::null_mut()
 }
 
 /// Destroy the bump allocator, freeing all arena pages.
