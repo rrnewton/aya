@@ -109,7 +109,7 @@ const fn round_up(val: u64, align: u64) -> u64 {
 ///
 /// `bump` must point to a valid, writable `BumpAllocator`.
 /// `arena_map` must point to a valid `BPF_MAP_TYPE_ARENA` map.
-#[inline(always)]
+#[inline(never)]
 pub unsafe fn bump_init(
     bump: *mut BumpAllocator,
     arena_map: *mut c_void,
