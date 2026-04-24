@@ -77,7 +77,11 @@ pub fn arena_alloc_pages(
             lateout("r0") ret,
         );
     }
-    ret
+    // The kfunc returns an arena pointer (address_space=1). Since Rust
+    // doesn't support address_space annotations, we must explicitly cast
+    // to kernel pointer (address_space=0) so the BPF verifier recognizes
+    // the return value as a dereferenceable pointer.
+    cast_kern(ret)
 }
 
 /// Free pages back to a BPF arena map.
