@@ -349,7 +349,7 @@ pub unsafe fn arena_slab_init(
     if slot_size < SLAB_MIN_SLOT_SIZE || !slot_size.is_multiple_of(8) {
         return -1;
     }
-    core::ptr::write_volatile(
+    core::ptr::write(
         slab,
         ArenaSlabState {
             bump: ArenaBumpState::new(capacity),
