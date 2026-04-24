@@ -1,4 +1,5 @@
-use aya::{Ebpf, maps::Array, maps::arena::Arena, programs::SyscallProgram, util::KernelVersion};
+use aya::{EbpfLoader, Ebpf, maps::Array, maps::arena::Arena, programs::SyscallProgram, util::KernelVersion};
+use aya::VerifierLogLevel;
 use aya_arena_common::{
     ArenaListHead, ArenaNodeHeader, ArenaPtr, CounterNode, LabelNode, TAG_COUNTER, TAG_LABEL,
     arena_hash_for_each, arena_hash_get, arena_btree_get, arena_btree_for_each,
@@ -17,7 +18,9 @@ fn skip_if_no_arena() -> bool {
 /// Load a BPF_PROG_TYPE_SYSCALL program, invoke it via test_run,
 /// and return the Ebpf instance for assertion.
 fn load_and_trigger(bpf_bytes: &[u8], prog_name: &str) -> Ebpf {
-    let mut bpf = Ebpf::load(bpf_bytes).unwrap();
+    let mut bpf = EbpfLoader::new()
+        .verifier_log_level(VerifierLogLevel::VERBOSE)
+        .load(bpf_bytes).unwrap();
 
     let prog: &mut SyscallProgram = bpf
         .program_mut(prog_name)
