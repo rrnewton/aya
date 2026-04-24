@@ -23,7 +23,7 @@
 use core::ffi::c_void;
 use core::ptr;
 
-use super::{arena_alloc_pages, arena_free_pages, NUMA_NO_NODE};
+use super::{arena_alloc_pages, arena_free_pages, cast_kern, NUMA_NO_NODE};
 
 /// Page size (4096 bytes on most architectures).
 const PAGE_SIZE: u64 = 4096;
@@ -166,7 +166,9 @@ pub unsafe fn bump_alloc(
     alignment: u64,
 ) -> *mut c_void {
     // Read current state with volatile to prevent reordering.
-    let memory = unsafe { ptr::read_volatile(&raw const (*bump).memory) };
+    // Re-apply cast_kern after loading the stored arena pointer — the verifier
+    // loses the arena type when values are stored in .data/.bss and read back.
+    let memory = cast_kern(unsafe { ptr::read_volatile(&raw const (*bump).memory) });
     let off = unsafe { ptr::read_volatile(&raw const (*bump).off) };
     let max_contig = unsafe { ptr::read_volatile(&raw const (*bump).max_contig_bytes) };
     let lim = unsafe { ptr::read_volatile(&raw const (*bump).lim_memusage) };
@@ -179,7 +181,9 @@ pub unsafe fn bump_alloc(
     // Check if allocation fits in current block.
     if off + alloc_bytes <= max_contig {
         // Fast path: fits in current block.
-        let result = (addr + padding) as *mut c_void;
+        // Use pointer arithmetic on the arena pointer to preserve verifier type.
+        let result = unsafe { (memory as *mut u8).add((off + padding) as usize) as *mut c_void };
+        let result = cast_kern(result);
         unsafe {
             ptr::write_volatile(&raw mut (*bump).off, off + alloc_bytes);
         }
@@ -219,7 +223,10 @@ pub unsafe fn bump_alloc(
         return ptr::null_mut();
     }
 
-    let result = (new_addr + new_padding) as *mut c_void;
+    let result = unsafe {
+        (new_memory as *mut u8).add((link_size + new_padding) as usize) as *mut c_void
+    };
+    let result = cast_kern(result);
 
     unsafe {
         ptr::write_volatile(&raw mut (*bump).memory, new_memory);
