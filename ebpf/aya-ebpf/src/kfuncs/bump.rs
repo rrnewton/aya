@@ -165,6 +165,11 @@ pub unsafe fn bump_alloc(
     bytes: u64,
     alignment: u64,
 ) -> *mut c_void {
+    // Prevent the compiler from using arena_map for address computations.
+    // arena_map is a map descriptor pointer (map_ptr), and the BPF verifier
+    // prohibits pointer arithmetic on it. Only arena_alloc_pages should use it.
+    let arena_map = core::hint::black_box(arena_map);
+
     // Read current state with volatile to prevent reordering.
     // Re-apply cast_kern after loading the stored arena pointer — the verifier
     // loses the arena type when values are stored in .data/.bss and read back.
