@@ -12,10 +12,9 @@
 use aya_arena_common::{arena_slab_alloc, arena_slab_free, arena_slab_init, arena_slab_stats, ArenaSlabState};
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
-    kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
+    kfuncs::{arena_alloc_pages, cast_kern, NUMA_NO_NODE},
     macros::{btf_map, map},
     maps::Array,
-    
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -57,16 +56,18 @@ impl ArenaMapDef {
 #[btf_map]
 static ARENA: ArenaMapDef = ArenaMapDef::new();
 
-// ── Bump allocator state ───────────────────────────────────────────────
-
-#[unsafe(no_mangle)]
-static mut BUMP: BumpAllocator = BumpAllocator::new();
+// ── Globals ───────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 static mut INITIALIZED: u64 = 0;
 
+/// Arena memory base pointer, stored via volatile after arena_alloc_pages.
 #[unsafe(no_mangle)]
-static mut ARENA_MAP_PTR: *mut c_void = core::ptr::null_mut();
+static mut ARENA_BASE: *mut u8 = core::ptr::null_mut();
+
+/// Current allocation offset within arena memory.
+#[unsafe(no_mangle)]
+static mut ARENA_OFF: u64 = 0;
 
 // ── Results map ────────────────────────────────────────────────────────
 
@@ -82,43 +83,52 @@ fn result_set(index: u32, value: u64) {
     }
 }
 
+/// Simple bump allocator using volatile globals.
+/// Returns a cast_kern'd arena pointer or null.
+#[inline(always)]
+unsafe fn arena_bump(size: u64, align: u64) -> *mut c_void {
+    let base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
+    let off = core::ptr::read_volatile(&raw const ARENA_OFF);
+    let aligned = (off + align - 1) & !(align - 1);
+    let new_off = aligned + size;
+    core::ptr::write_volatile(&raw mut ARENA_OFF, new_off);
+    base.add(aligned as usize) as *mut c_void
+}
+
 // ── Slab allocator test ────────────────────────────────────────────────
 
-const BUMP_INIT_PAGES: u32 = 8;
+const ALLOC_PAGES: u32 = 8;
 const SLAB_REGION_SIZE: u64 = 4096;
 const SLOT_SIZE: u32 = 64;
 
-#[inline(always)]
-unsafe fn run_slab_test(arena_ptr: *mut c_void) -> i64 {
-    // Initialize bump allocator
-    let ret = unsafe { bump_init(&raw mut BUMP, arena_ptr, BUMP_INIT_PAGES) };
-    if ret != 0 {
+/// Initialize arena: allocate pages, store base in volatile global.
+/// This is a separate subprogram so the ARENA map_ptr doesn't leak
+/// into the caller's register state.
+#[inline(never)]
+unsafe fn init_arena() -> i32 {
+    let mem = arena_alloc_pages(ARENA.as_ptr(), core::ptr::null_mut(), ALLOC_PAGES, NUMA_NO_NODE, 0);
+    if mem.is_null() {
         return -1;
     }
+    core::ptr::write_volatile(&raw mut ARENA_BASE, mem as *mut u8);
+    core::ptr::write_volatile(&raw mut ARENA_OFF, 0);
+    0
+}
 
+#[inline(always)]
+unsafe fn run_slab_test() -> i64 {
     // Allocate slab state header
-    let slab_raw = unsafe {
-        bump_alloc(
-            &raw mut BUMP,
-            arena_ptr,
-            size_of::<ArenaSlabState>() as u64,
-            align_of::<ArenaSlabState>() as u64,
-        )
-    };
+    let slab_raw = arena_bump(
+        size_of::<ArenaSlabState>() as u64,
+        align_of::<ArenaSlabState>() as u64,
+    );
     if slab_raw.is_null() {
         return -2;
     }
     let slab = slab_raw.cast::<ArenaSlabState>();
 
     // Allocate a region for slab slots
-    let region_raw = unsafe {
-        bump_alloc(
-            &raw mut BUMP,
-            arena_ptr,
-            SLAB_REGION_SIZE,
-            8,
-        )
-    };
+    let region_raw = arena_bump(SLAB_REGION_SIZE, 8);
     if region_raw.is_null() {
         return -3;
     }
@@ -129,56 +139,54 @@ unsafe fn run_slab_test(arena_ptr: *mut c_void) -> i64 {
     let region_base = region_raw as *mut u8;
 
     // Initialize slab: capacity = SLAB_REGION_SIZE, slot_size = 64
-    let ret = unsafe { arena_slab_init(slab, SLAB_REGION_SIZE, SLOT_SIZE) };
+    let ret = arena_slab_init(slab, SLAB_REGION_SIZE, SLOT_SIZE);
     if ret != 0 {
         return -4;
     }
 
     // Allocate 4 slots
     let mut all_nonnull: u64 = 1;
-    let slot0 = unsafe { arena_slab_alloc(slab, region_base) };
+    let slot0 = arena_slab_alloc(slab, region_base);
     if slot0.is_null() {
         all_nonnull = 0;
     }
-    let slot1 = unsafe { arena_slab_alloc(slab, region_base) };
+    let slot1 = arena_slab_alloc(slab, region_base);
     if slot1.is_null() {
         all_nonnull = 0;
     }
-    let slot2 = unsafe { arena_slab_alloc(slab, region_base) };
+    let slot2 = arena_slab_alloc(slab, region_base);
     if slot2.is_null() {
         all_nonnull = 0;
     }
-    let slot3 = unsafe { arena_slab_alloc(slab, region_base) };
+    let slot3 = arena_slab_alloc(slab, region_base);
     if slot3.is_null() {
         all_nonnull = 0;
     }
 
     // RESULTS[0] = total_allocated after initial 4 allocs (expect 4)
-    let stats = unsafe { arena_slab_stats(slab) };
+    let stats = arena_slab_stats(slab);
     result_set(0, stats.total_allocated as u64);
 
     // Free 2 slots (slot1 and slot2)
-    unsafe {
-        arena_slab_free(slab, slot1, region_base);
-        arena_slab_free(slab, slot2, region_base);
-    }
+    arena_slab_free(slab, slot1, region_base);
+    arena_slab_free(slab, slot2, region_base);
 
     // RESULTS[1] = free_count after freeing 2 (expect 2)
-    let stats = unsafe { arena_slab_stats(slab) };
+    let stats = arena_slab_stats(slab);
     result_set(1, stats.free_count as u64);
 
     // Allocate 2 more (should reuse from free list)
-    let slot4 = unsafe { arena_slab_alloc(slab, region_base) };
+    let slot4 = arena_slab_alloc(slab, region_base);
     if slot4.is_null() {
         all_nonnull = 0;
     }
-    let slot5 = unsafe { arena_slab_alloc(slab, region_base) };
+    let slot5 = arena_slab_alloc(slab, region_base);
     if slot5.is_null() {
         all_nonnull = 0;
     }
 
     // RESULTS[2] = total_allocated after reuse allocs (expect 4, NOT 6)
-    let stats = unsafe { arena_slab_stats(slab) };
+    let stats = arena_slab_stats(slab);
     result_set(2, stats.total_allocated as u64);
 
     // RESULTS[3] = free_count after reuse allocs (expect 0)
@@ -200,11 +208,13 @@ fn arena_slab_test(_ctx: *mut c_void) -> i32 {
         return 0;
     }
 
-    let arena_ptr = ARENA.as_ptr();
-    let _ret = unsafe { run_slab_test(arena_ptr) };
+    let ret = unsafe { init_arena() };
+    if ret != 0 {
+        return 0;
+    }
 
-    // Always allow socket creation, even if test failed.
-    // Results are communicated via the RESULTS array map.
+    let _ret = unsafe { run_slab_test() };
+
     unsafe {
         core::ptr::write_volatile(&raw mut INITIALIZED, 1);
     }

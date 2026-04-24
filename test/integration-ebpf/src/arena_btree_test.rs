@@ -15,10 +15,9 @@ use aya_arena_common::{
 };
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
-    kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
+    kfuncs::{arena_alloc_pages, cast_kern, NUMA_NO_NODE},
     macros::{btf_map, map},
     maps::Array,
-    
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -60,16 +59,18 @@ impl ArenaMapDef {
 #[btf_map]
 static ARENA: ArenaMapDef = ArenaMapDef::new();
 
-// ── Bump allocator state ───────────────────────────────────────────────
-
-#[unsafe(no_mangle)]
-static mut BUMP: BumpAllocator = BumpAllocator::new();
+// ── Globals ───────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 static mut INITIALIZED: u64 = 0;
 
+/// Arena memory base pointer, stored via volatile after arena_alloc_pages.
 #[unsafe(no_mangle)]
-static mut ARENA_MAP_PTR: *mut c_void = core::ptr::null_mut();
+static mut ARENA_BASE: *mut u8 = core::ptr::null_mut();
+
+/// Current allocation offset within arena memory.
+#[unsafe(no_mangle)]
+static mut ARENA_OFF: u64 = 0;
 
 // ── Results map ────────────────────────────────────────────────────────
 
@@ -85,61 +86,63 @@ fn result_set(index: u32, value: u64) {
     }
 }
 
+/// Simple bump allocator using volatile globals.
+/// Returns a cast_kern'd arena pointer or null.
+#[inline(always)]
+unsafe fn arena_bump(size: u64, align: u64) -> *mut c_void {
+    let base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
+    let off = core::ptr::read_volatile(&raw const ARENA_OFF);
+    let aligned = (off + align - 1) & !(align - 1);
+    let new_off = aligned + size;
+    core::ptr::write_volatile(&raw mut ARENA_OFF, new_off);
+    base.add(aligned as usize) as *mut c_void
+}
+
 // ── B-tree test ────────────────────────────────────────────────────────
 
-const BUMP_INIT_PAGES: u32 = 16;
+const ALLOC_PAGES: u32 = 16;
 const BTREE_REGION_SIZE: u64 = 32 * 1024;
 
-#[inline(always)]
-unsafe fn run_btree_test(arena_ptr: *mut c_void) -> i64 {
-    // Initialize bump allocator (16 pages for btree nodes)
-    let ret = unsafe { bump_init(&raw mut BUMP, arena_ptr, BUMP_INIT_PAGES) };
-    if ret != 0 {
+/// Initialize arena: allocate pages, store base in volatile global.
+/// This is a separate subprogram so the ARENA map_ptr doesn't leak
+/// into the caller's register state.
+#[inline(never)]
+unsafe fn init_arena() -> i32 {
+    let mem = arena_alloc_pages(ARENA.as_ptr(), core::ptr::null_mut(), ALLOC_PAGES, NUMA_NO_NODE, 0);
+    if mem.is_null() {
         return -1;
     }
+    core::ptr::write_volatile(&raw mut ARENA_BASE, mem as *mut u8);
+    core::ptr::write_volatile(&raw mut ARENA_OFF, 0);
+    0
+}
 
+#[inline(always)]
+unsafe fn run_btree_test() -> i64 {
     // Allocate B-tree map header
-    let tree_raw = unsafe {
-        bump_alloc(
-            &raw mut BUMP,
-            arena_ptr,
-            size_of::<ArenaBTreeMap>() as u64,
-            align_of::<ArenaBTreeMap>() as u64,
-        )
-    };
+    let tree_raw = arena_bump(size_of::<ArenaBTreeMap>() as u64, align_of::<ArenaBTreeMap>() as u64);
     if tree_raw.is_null() {
         return -2;
     }
     let tree = tree_raw.cast::<ArenaBTreeMap>();
 
     // Allocate ArenaBumpState for btree node allocation
-    let bump_state_raw = unsafe {
-        bump_alloc(
-            &raw mut BUMP,
-            arena_ptr,
-            size_of::<ArenaBumpState>() as u64,
-            align_of::<ArenaBumpState>() as u64,
-        )
-    };
+    let bump_state_raw = arena_bump(
+        size_of::<ArenaBumpState>() as u64,
+        align_of::<ArenaBumpState>() as u64,
+    );
     if bump_state_raw.is_null() {
         return -3;
     }
     let bump_state = bump_state_raw.cast::<ArenaBumpState>();
 
     // Allocate a region for btree nodes
-    let region_raw = unsafe {
-        bump_alloc(
-            &raw mut BUMP,
-            arena_ptr,
-            BTREE_REGION_SIZE,
-            8,
-        )
-    };
+    let region_raw = arena_bump(BTREE_REGION_SIZE, 8);
     if region_raw.is_null() {
         return -4;
     }
 
-    let arena_base = arena_ptr as *mut u8;
+    let arena_base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
     let region = region_raw as *mut u8;
 
     // Initialize the ArenaBumpState for btree node allocation.
@@ -155,12 +158,12 @@ unsafe fn run_btree_test(arena_ptr: *mut c_void) -> i64 {
     );
 
     // Initialize the btree
-    unsafe { arena_btree_init(tree) };
+    arena_btree_init(tree);
 
     // Insert 10 entries: keys 1..=10, values key*10
     let mut i: u64 = 1;
     while i <= 10 {
-        let ret = unsafe { arena_btree_insert(tree, bump_state, i, i * 10, arena_base) };
+        let ret = arena_btree_insert(tree, bump_state, i, i * 10, arena_base);
         if ret < 0 {
             return -5;
         }
@@ -168,33 +171,33 @@ unsafe fn run_btree_test(arena_ptr: *mut c_void) -> i64 {
     }
 
     // RESULTS[0] = count (expect 10)
-    result_set(0, unsafe { (*tree).count });
+    result_set(0, (*tree).count);
 
     // RESULTS[1] = get(5) value (expect 50)
-    let val = unsafe { arena_btree_get(tree, 5, arena_base) };
+    let val = arena_btree_get(tree, 5, arena_base);
     if !val.is_null() {
-        result_set(1, unsafe { *val });
+        result_set(1, *val);
     }
 
     // RESULTS[2] = get(10) value (expect 100)
-    let val = unsafe { arena_btree_get(tree, 10, arena_base) };
+    let val = arena_btree_get(tree, 10, arena_base);
     if !val.is_null() {
-        result_set(2, unsafe { *val });
+        result_set(2, *val);
     }
 
     // RESULTS[3] = 1 if get(999) returns null, else 0
-    let val = unsafe { arena_btree_get(tree, 999, arena_base) };
+    let val = arena_btree_get(tree, 999, arena_base);
     result_set(3, if val.is_null() { 1 } else { 0 });
 
     // RESULTS[4] = delete(3) return code (expect 0)
-    let ret = unsafe { arena_btree_delete(tree, 3, arena_base) };
+    let ret = arena_btree_delete(tree, 3, arena_base);
     result_set(4, ret as u64);
 
     // RESULTS[5] = count after delete (expect 9)
-    result_set(5, unsafe { (*tree).count });
+    result_set(5, (*tree).count);
 
     // RESULTS[6] = 1 if get(3) returns null after delete, else 0
-    let val = unsafe { arena_btree_get(tree, 3, arena_base) };
+    let val = arena_btree_get(tree, 3, arena_base);
     result_set(6, if val.is_null() { 1 } else { 0 });
 
     0
@@ -210,11 +213,13 @@ fn arena_btree_test(_ctx: *mut c_void) -> i32 {
         return 0;
     }
 
-    let arena_ptr = ARENA.as_ptr();
-    let _ret = unsafe { run_btree_test(arena_ptr) };
+    let ret = unsafe { init_arena() };
+    if ret != 0 {
+        return 0;
+    }
 
-    // Always allow socket creation, even if test failed.
-    // Results are communicated via the RESULTS array map.
+    let _ret = unsafe { run_btree_test() };
+
     unsafe {
         core::ptr::write_volatile(&raw mut INITIALIZED, 1);
     }

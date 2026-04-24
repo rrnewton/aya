@@ -2,9 +2,9 @@
 //!
 //! Builds three data structures in shared arena memory so userspace can
 //! read them directly via the mmap'd region:
-//!   1. Linked list: Counter(1) → Label("hello") → Counter(2) → Label("arena") → Counter(3)
-//!   2. Hash map: 5 entries (1001→10, 1002→20, 1003→30, 1004→40, 1005→50)
-//!   3. B-tree: 10 entries, keys 1..=10, values key×10
+//!   1. Linked list: Counter(1) -> Label("hello") -> Counter(2) -> Label("arena") -> Counter(3)
+//!   2. Hash map: 5 entries (1001->10, 1002->20, 1003->30, 1004->40, 1005->50)
+//!   3. B-tree: 10 entries, keys 1..=10, values key*10
 //!
 //! RESULTS layout (offsets from arena base):
 //!   [0] = ArenaListHead offset
@@ -26,10 +26,9 @@ use aya_arena_common::{
 };
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
-    kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
+    kfuncs::{arena_alloc_pages, cast_kern, NUMA_NO_NODE},
     macros::{btf_map, map},
     maps::Array,
-    
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -71,16 +70,18 @@ impl ArenaMapDef {
 #[btf_map]
 static ARENA: ArenaMapDef = ArenaMapDef::new();
 
-// ── Bump allocator + globals ──────────────────────────────────────────
-
-#[unsafe(no_mangle)]
-static mut BUMP: BumpAllocator = BumpAllocator::new();
+// ── Globals ──────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 static mut INITIALIZED: u64 = 0;
 
+/// Arena memory base pointer, stored via volatile after arena_alloc_pages.
 #[unsafe(no_mangle)]
-static mut ARENA_MAP_PTR: *mut c_void = core::ptr::null_mut();
+static mut ARENA_BASE: *mut u8 = core::ptr::null_mut();
+
+/// Current allocation offset within arena memory.
+#[unsafe(no_mangle)]
+static mut ARENA_OFF: u64 = 0;
 
 // ── Results map ───────────────────────────────────────────────────────
 
@@ -96,17 +97,45 @@ fn result_set(index: u32, value: u64) {
     }
 }
 
+/// Simple bump allocator using volatile globals.
+/// Returns a cast_kern'd arena pointer or null.
+#[inline(always)]
+unsafe fn arena_bump(size: u64, align: u64) -> *mut c_void {
+    let base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
+    let off = core::ptr::read_volatile(&raw const ARENA_OFF);
+    let aligned = (off + align - 1) & !(align - 1);
+    let new_off = aligned + size;
+    core::ptr::write_volatile(&raw mut ARENA_OFF, new_off);
+    base.add(aligned as usize) as *mut c_void
+}
+
+// ── Constants ─────────────────────────────────────────────────────────
+
+const ALLOC_PAGES: u32 = 32;
+const HASH_CAPACITY: u32 = 8;
+const BTREE_REGION_SIZE: u64 = 32 * 1024;
+
+/// Initialize arena: allocate pages, store base in volatile global.
+/// This is a separate subprogram so the ARENA map_ptr doesn't leak
+/// into the caller's register state.
+#[inline(never)]
+unsafe fn init_arena() -> i32 {
+    let mem = arena_alloc_pages(ARENA.as_ptr(), core::ptr::null_mut(), ALLOC_PAGES, NUMA_NO_NODE, 0);
+    if mem.is_null() {
+        return -1;
+    }
+    core::ptr::write_volatile(&raw mut ARENA_BASE, mem as *mut u8);
+    core::ptr::write_volatile(&raw mut ARENA_OFF, 0);
+    0
+}
+
 // ── Build linked list ─────────────────────────────────────────────────
 
-const BUMP_INIT_PAGES: u32 = 32;
-
 #[inline(always)]
-unsafe fn build_linked_list(arena_ptr: *mut c_void) -> i64 {
-    let arena_base = arena_ptr as *mut u8;
+unsafe fn build_linked_list() -> i64 {
+    let arena_base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
 
-    let head_raw = bump_alloc(
-        &raw mut BUMP,
-        arena_ptr,
+    let head_raw = arena_bump(
         size_of::<ArenaListHead>() as u64,
         align_of::<ArenaListHead>() as u64,
     );
@@ -122,9 +151,7 @@ unsafe fn build_linked_list(arena_ptr: *mut c_void) -> i64 {
 
     macro_rules! push_counter {
         ($val:expr) => {{
-            let raw = bump_alloc(
-                &raw mut BUMP,
-                arena_ptr,
+            let raw = arena_bump(
                 size_of::<CounterNode>() as u64,
                 align_of::<CounterNode>() as u64,
             );
@@ -143,16 +170,14 @@ unsafe fn build_linked_list(arena_ptr: *mut c_void) -> i64 {
                     value: $val,
                 },
             );
-            list_head_ptr = ArenaPtr::from_raw(node.cast(), arena_base);
+            list_head_ptr = ArenaPtr::from_raw(node.cast(), arena_base as *mut u8);
             count += 1;
         }};
     }
 
     macro_rules! push_label {
         ($bytes:expr) => {{
-            let raw = bump_alloc(
-                &raw mut BUMP,
-                arena_ptr,
+            let raw = arena_bump(
                 size_of::<LabelNode>() as u64,
                 align_of::<LabelNode>() as u64,
             );
@@ -185,7 +210,7 @@ unsafe fn build_linked_list(arena_ptr: *mut c_void) -> i64 {
                     _pad: 0,
                 },
             );
-            list_head_ptr = ArenaPtr::from_raw(node.cast(), arena_base);
+            list_head_ptr = ArenaPtr::from_raw(node.cast(), arena_base as *mut u8);
             count += 1;
         }};
     }
@@ -210,15 +235,11 @@ unsafe fn build_linked_list(arena_ptr: *mut c_void) -> i64 {
 
 // ── Build hash map ────────────────────────────────────────────────────
 
-const HASH_CAPACITY: u32 = 8;
-
 #[inline(always)]
-unsafe fn build_hashmap(arena_ptr: *mut c_void) -> i64 {
-    let arena_base = arena_ptr as *mut u8;
+unsafe fn build_hashmap() -> i64 {
+    let arena_base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
 
-    let header_raw = bump_alloc(
-        &raw mut BUMP,
-        arena_ptr,
+    let header_raw = arena_bump(
         size_of::<ArenaHashMap>() as u64,
         align_of::<ArenaHashMap>() as u64,
     );
@@ -229,9 +250,7 @@ unsafe fn build_hashmap(arena_ptr: *mut c_void) -> i64 {
     let header_offset = header_raw as u64 - arena_base as u64;
     result_set(1, header_offset);
 
-    let entries_raw = bump_alloc(
-        &raw mut BUMP,
-        arena_ptr,
+    let entries_raw = arena_bump(
         (size_of::<ArenaHashEntry>() * HASH_CAPACITY as usize) as u64,
         align_of::<ArenaHashEntry>() as u64,
     );
@@ -240,31 +259,27 @@ unsafe fn build_hashmap(arena_ptr: *mut c_void) -> i64 {
     }
     let entries = entries_raw.cast::<ArenaHashEntry>();
 
-    let ret = arena_hash_init(header, entries, HASH_CAPACITY, arena_base);
+    let ret = arena_hash_init(header, entries, HASH_CAPACITY, arena_base as *mut u8);
     if ret != 0 {
         return -22;
     }
 
-    arena_hash_insert(header, 1001, 10, arena_base);
-    arena_hash_insert(header, 1002, 20, arena_base);
-    arena_hash_insert(header, 1003, 30, arena_base);
-    arena_hash_insert(header, 1004, 40, arena_base);
-    arena_hash_insert(header, 1005, 50, arena_base);
+    arena_hash_insert(header, 1001, 10, arena_base as *mut u8);
+    arena_hash_insert(header, 1002, 20, arena_base as *mut u8);
+    arena_hash_insert(header, 1003, 30, arena_base as *mut u8);
+    arena_hash_insert(header, 1004, 40, arena_base as *mut u8);
+    arena_hash_insert(header, 1005, 50, arena_base as *mut u8);
 
     0
 }
 
 // ── Build B-tree ──────────────────────────────────────────────────────
 
-const BTREE_REGION_SIZE: u64 = 32 * 1024;
-
 #[inline(always)]
-unsafe fn build_btree(arena_ptr: *mut c_void) -> i64 {
-    let arena_base = arena_ptr as *mut u8;
+unsafe fn build_btree() -> i64 {
+    let arena_base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
 
-    let tree_raw = bump_alloc(
-        &raw mut BUMP,
-        arena_ptr,
+    let tree_raw = arena_bump(
         size_of::<ArenaBTreeMap>() as u64,
         align_of::<ArenaBTreeMap>() as u64,
     );
@@ -275,9 +290,7 @@ unsafe fn build_btree(arena_ptr: *mut c_void) -> i64 {
     let tree_offset = tree_raw as u64 - arena_base as u64;
     result_set(2, tree_offset);
 
-    let bump_state_raw = bump_alloc(
-        &raw mut BUMP,
-        arena_ptr,
+    let bump_state_raw = arena_bump(
         size_of::<ArenaBumpState>() as u64,
         align_of::<ArenaBumpState>() as u64,
     );
@@ -288,7 +301,7 @@ unsafe fn build_btree(arena_ptr: *mut c_void) -> i64 {
     let bump_state_offset = bump_state_raw as u64 - arena_base as u64;
     result_set(3, bump_state_offset);
 
-    let region_raw = bump_alloc(&raw mut BUMP, arena_ptr, BTREE_REGION_SIZE, 8);
+    let region_raw = arena_bump(BTREE_REGION_SIZE, 8);
     if region_raw.is_null() {
         return -32;
     }
@@ -306,7 +319,7 @@ unsafe fn build_btree(arena_ptr: *mut c_void) -> i64 {
 
     let mut i: u64 = 1;
     while i <= 10 {
-        let ret = arena_btree_insert(tree, bump_state, i, i * 10, arena_base);
+        let ret = arena_btree_insert(tree, bump_state, i, i * 10, arena_base as *mut u8);
         if ret < 0 {
             return -33;
         }
@@ -319,26 +332,20 @@ unsafe fn build_btree(arena_ptr: *mut c_void) -> i64 {
 // ── Entry point ───────────────────────────────────────────────────────
 
 #[inline(always)]
-unsafe fn run_cross_test(arena_ptr: *mut c_void) -> i64 {
-    let ret = bump_init(&raw mut BUMP, arena_ptr, BUMP_INIT_PAGES);
-    if ret != 0 {
-        result_set(4, (-1i64) as u64);
-        return -1;
-    }
-
-    let ret = build_linked_list(arena_ptr);
+unsafe fn run_cross_test() -> i64 {
+    let ret = build_linked_list();
     if ret != 0 {
         result_set(4, ret as u64);
         return ret;
     }
 
-    let ret = build_hashmap(arena_ptr);
+    let ret = build_hashmap();
     if ret != 0 {
         result_set(4, ret as u64);
         return ret;
     }
 
-    let ret = build_btree(arena_ptr);
+    let ret = build_btree();
     if ret != 0 {
         result_set(4, ret as u64);
         return ret;
@@ -356,11 +363,13 @@ fn arena_cross_test(_ctx: *mut c_void) -> i32 {
         return 0;
     }
 
-    let arena_ptr = ARENA.as_ptr();
-    let _ret = unsafe { run_cross_test(arena_ptr) };
+    let ret = unsafe { init_arena() };
+    if ret != 0 {
+        return 0;
+    }
 
-    // Always allow socket creation, even if test failed.
-    // Results are communicated via the RESULTS array map.
+    let _ret = unsafe { run_cross_test() };
+
     unsafe {
         core::ptr::write_volatile(&raw mut INITIALIZED, 1);
     }
