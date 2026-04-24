@@ -1,7 +1,7 @@
 //! Arena hash map integration test — BPF side.
 //!
-//! Tests ArenaHashMap operations (insert, get, delete) using arena memory
-//! with a bump allocator. Results are reported via an Array map.
+//! Tests ArenaHashMap operations (insert, get, delete) using arena memory.
+//! Results are reported via an Array map.
 //!
 //! Requires kernel 6.9+ with BPF_MAP_TYPE_ARENA support.
 
@@ -15,10 +15,9 @@ use aya_arena_common::{
 };
 use aya_ebpf::{
     bindings::bpf_map_type::BPF_MAP_TYPE_ARENA,
-    kfuncs::bump::{bump_alloc, bump_init, BumpAllocator},
+    kfuncs::{arena_alloc_pages, cast_kern, NUMA_NO_NODE},
     macros::{btf_map, map},
     maps::Array,
-    
 };
 use core::ffi::c_void;
 #[cfg(not(test))]
@@ -60,19 +59,18 @@ impl ArenaMapDef {
 #[btf_map]
 static ARENA: ArenaMapDef = ArenaMapDef::new();
 
-// ── Bump allocator state ───────────────────────────────────────────────
-
-#[unsafe(no_mangle)]
-static mut BUMP: BumpAllocator = BumpAllocator::new();
+// ── Globals ───────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 static mut INITIALIZED: u64 = 0;
 
-/// Volatile global to break compiler tracking of the arena map pointer.
-/// The BPF verifier prohibits pointer arithmetic on map_ptr, so we must
-/// prevent the compiler from using ARENA.as_ptr() for address computations.
+/// Arena memory base pointer, stored via volatile after arena_alloc_pages.
 #[unsafe(no_mangle)]
-static mut ARENA_MAP_PTR: *mut c_void = core::ptr::null_mut();
+static mut ARENA_BASE: *mut u8 = core::ptr::null_mut();
+
+/// Current allocation offset within arena memory.
+#[unsafe(no_mangle)]
+static mut ARENA_OFF: u64 = 0;
 
 // ── Results map ────────────────────────────────────────────────────────
 
@@ -88,92 +86,100 @@ fn result_set(index: u32, value: u64) {
     }
 }
 
+/// Simple bump allocator using volatile globals.
+/// Returns a cast_kern'd arena pointer or null.
+#[inline(always)]
+unsafe fn arena_bump(size: u64, align: u64) -> *mut c_void {
+    let base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
+    let off = core::ptr::read_volatile(&raw const ARENA_OFF);
+    let aligned = (off + align - 1) & !(align - 1);
+    let new_off = aligned + size;
+    core::ptr::write_volatile(&raw mut ARENA_OFF, new_off);
+    base.add(aligned as usize) as *mut c_void
+}
+
 // ── Hash map test ──────────────────────────────────────────────────────
 
-const BUMP_INIT_PAGES: u32 = 8;
+const ALLOC_PAGES: u32 = 8;
 const HASH_CAPACITY: u32 = 8;
 
-#[inline(always)]
-unsafe fn run_hashmap_test(arena_ptr: *mut c_void) -> i64 {
-    // Initialize bump allocator
-    let ret = unsafe { bump_init(&raw mut BUMP, arena_ptr, BUMP_INIT_PAGES) };
-    if ret != 0 {
+/// Initialize arena: allocate pages, store base in volatile global.
+/// This is a separate subprogram so the ARENA map_ptr doesn't leak
+/// into the caller's register state.
+#[inline(never)]
+unsafe fn init_arena() -> i32 {
+    let mem = arena_alloc_pages(ARENA.as_ptr(), core::ptr::null_mut(), ALLOC_PAGES, NUMA_NO_NODE, 0);
+    if mem.is_null() {
         return -1;
     }
+    core::ptr::write_volatile(&raw mut ARENA_BASE, mem as *mut u8);
+    core::ptr::write_volatile(&raw mut ARENA_OFF, 0);
+    0
+}
 
+#[inline(always)]
+unsafe fn run_hashmap_test() -> i64 {
     // Allocate hash map header
-    let header_raw = unsafe {
-        bump_alloc(
-            &raw mut BUMP,
-            arena_ptr,
-            size_of::<ArenaHashMap>() as u64,
-            align_of::<ArenaHashMap>() as u64,
-        )
-    };
+    let header_raw = arena_bump(size_of::<ArenaHashMap>() as u64, align_of::<ArenaHashMap>() as u64);
     if header_raw.is_null() {
         return -2;
     }
     let header = header_raw.cast::<ArenaHashMap>();
 
     // Allocate entry slots
-    let entries_raw = unsafe {
-        bump_alloc(
-            &raw mut BUMP,
-            arena_ptr,
-            (size_of::<ArenaHashEntry>() * HASH_CAPACITY as usize) as u64,
-            align_of::<ArenaHashEntry>() as u64,
-        )
-    };
+    let entries_raw = arena_bump(
+        (size_of::<ArenaHashEntry>() * HASH_CAPACITY as usize) as u64,
+        align_of::<ArenaHashEntry>() as u64,
+    );
     if entries_raw.is_null() {
         return -3;
     }
     let entries = entries_raw.cast::<ArenaHashEntry>();
 
-    let arena_base = arena_ptr as *mut u8;
+    // Use the arena base as the ArenaPtr base for hash map operations
+    let arena_base = cast_kern(core::ptr::read_volatile(&raw const ARENA_BASE));
 
     // Initialize hash map
-    let ret = unsafe { arena_hash_init(header, entries, HASH_CAPACITY, arena_base) };
+    let ret = arena_hash_init(header, entries, HASH_CAPACITY, arena_base);
     if ret != 0 {
         return -4;
     }
 
     // Insert 5 entries
-    unsafe {
-        arena_hash_insert(header, 1001, 10, arena_base);
-        arena_hash_insert(header, 1002, 20, arena_base);
-        arena_hash_insert(header, 1003, 30, arena_base);
-        arena_hash_insert(header, 1004, 40, arena_base);
-        arena_hash_insert(header, 1005, 50, arena_base);
-    }
+    arena_hash_insert(header, 1001, 10, arena_base);
+    arena_hash_insert(header, 1002, 20, arena_base);
+    arena_hash_insert(header, 1003, 30, arena_base);
+    arena_hash_insert(header, 1004, 40, arena_base);
+    arena_hash_insert(header, 1005, 50, arena_base);
 
     // RESULTS[0] = count (expect 5)
-    result_set(0, unsafe { (*header).count } as u64);
+    result_set(0, (*header).count as u64);
 
     // RESULTS[1] = get(1001) value (expect 10)
-    let val = unsafe { arena_hash_get(header, 1001, arena_base) };
+    let val = arena_hash_get(header, 1001, arena_base);
     if !val.is_null() {
-        result_set(1, unsafe { *val });
+        result_set(1, *val);
     }
 
     // RESULTS[2] = get(1005) value (expect 50)
-    let val = unsafe { arena_hash_get(header, 1005, arena_base) };
+    let val = arena_hash_get(header, 1005, arena_base);
     if !val.is_null() {
-        result_set(2, unsafe { *val });
+        result_set(2, *val);
     }
 
     // RESULTS[3] = 1 if get(9999) returns null, else 0
-    let val = unsafe { arena_hash_get(header, 9999, arena_base) };
+    let val = arena_hash_get(header, 9999, arena_base);
     result_set(3, if val.is_null() { 1 } else { 0 });
 
     // RESULTS[4] = delete(1003) return code (expect 0)
-    let ret = unsafe { arena_hash_delete(header, 1003, arena_base) };
+    let ret = arena_hash_delete(header, 1003, arena_base);
     result_set(4, ret as u64);
 
     // RESULTS[5] = count after delete (expect 4)
-    result_set(5, unsafe { (*header).count } as u64);
+    result_set(5, (*header).count as u64);
 
     // RESULTS[6] = 1 if get(1003) returns null after delete, else 0
-    let val = unsafe { arena_hash_get(header, 1003, arena_base) };
+    let val = arena_hash_get(header, 1003, arena_base);
     result_set(6, if val.is_null() { 1 } else { 0 });
 
     0
@@ -189,15 +195,13 @@ fn arena_hashmap_test(_ctx: *mut c_void) -> i32 {
         return 0;
     }
 
-    // Store map pointer into volatile global to break compiler tracking.
-    // Reading it back via volatile prevents the compiler from substituting
-    // the map_ptr literal into address computations.
-    unsafe { core::ptr::write_volatile(&raw mut ARENA_MAP_PTR, ARENA.as_ptr()) };
-    let arena_ptr = unsafe { core::ptr::read_volatile(&raw const ARENA_MAP_PTR) };
-    let _ret = unsafe { run_hashmap_test(arena_ptr) };
+    let ret = unsafe { init_arena() };
+    if ret != 0 {
+        return 0;
+    }
 
-    // Always allow socket creation, even if test failed.
-    // Results are communicated via the RESULTS array map.
+    let _ret = unsafe { run_hashmap_test() };
+
     unsafe {
         core::ptr::write_volatile(&raw mut INITIALIZED, 1);
     }

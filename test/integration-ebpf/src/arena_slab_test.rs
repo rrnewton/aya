@@ -200,8 +200,7 @@ fn arena_slab_test(_ctx: *mut c_void) -> i32 {
         return 0;
     }
 
-    unsafe { core::ptr::write_volatile(&raw mut ARENA_MAP_PTR, ARENA.as_ptr()) };
-    let arena_ptr = unsafe { core::ptr::read_volatile(&raw const ARENA_MAP_PTR) };
+    let arena_ptr = ARENA.as_ptr();
     let _ret = unsafe { run_slab_test(arena_ptr) };
 
     // Always allow socket creation, even if test failed.
