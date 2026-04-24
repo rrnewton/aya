@@ -125,17 +125,23 @@ pub fn arena_free_pages(arena_map: *mut c_void, addr: *mut c_void, page_cnt: u32
 pub fn cast_kern<T>(ptr: *mut T) -> *mut T {
     let result: *mut T;
     unsafe {
-        // BPF_ALU64 | BPF_MOV | BPF_X = 0xbf
-        // off = 1 (addr_space_cast flag)
-        // imm = (dst_as << 16) | src_as = (0 << 16) | 1 = 1
-        // This translates to: r_dst = (addr_space_0)(addr_space_1)r_src
+        // Use .ifc conditional assembly to emit the correct register nibble.
+        // The BPF addr_space_cast instruction has dst_reg == src_reg.
         core::arch::asm!(
-            ".byte 0xbf",           // BPF_ALU64 | BPF_MOV | BPF_X
-            ".byte ({dst} * 16 + {src})", // dst_reg:src_reg nibbles
+            ".byte 0xbf",
+            ".ifc {0}, r0; .byte 0x00; .endif",
+            ".ifc {0}, r1; .byte 0x11; .endif",
+            ".ifc {0}, r2; .byte 0x22; .endif",
+            ".ifc {0}, r3; .byte 0x33; .endif",
+            ".ifc {0}, r4; .byte 0x44; .endif",
+            ".ifc {0}, r5; .byte 0x55; .endif",
+            ".ifc {0}, r6; .byte 0x66; .endif",
+            ".ifc {0}, r7; .byte 0x77; .endif",
+            ".ifc {0}, r8; .byte 0x88; .endif",
+            ".ifc {0}, r9; .byte 0x99; .endif",
             ".short 1",             // off = 1 (addr_space_cast)
             ".int 1",               // imm = (0 << 16) | 1
-            src = in(reg) ptr,
-            dst = lateout(reg) result,
+            inlateout(reg) ptr => result,
         );
     }
     result
@@ -150,11 +156,19 @@ pub fn cast_user<T>(ptr: *mut T) -> *mut T {
     unsafe {
         core::arch::asm!(
             ".byte 0xbf",
-            ".byte ({dst} * 16 + {src})",
+            ".ifc {0}, r0; .byte 0x00; .endif",
+            ".ifc {0}, r1; .byte 0x11; .endif",
+            ".ifc {0}, r2; .byte 0x22; .endif",
+            ".ifc {0}, r3; .byte 0x33; .endif",
+            ".ifc {0}, r4; .byte 0x44; .endif",
+            ".ifc {0}, r5; .byte 0x55; .endif",
+            ".ifc {0}, r6; .byte 0x66; .endif",
+            ".ifc {0}, r7; .byte 0x77; .endif",
+            ".ifc {0}, r8; .byte 0x88; .endif",
+            ".ifc {0}, r9; .byte 0x99; .endif",
             ".short 1",             // off = 1 (addr_space_cast)
             ".int 0x10000",         // imm = (1 << 16) | 0
-            src = in(reg) ptr,
-            dst = lateout(reg) result,
+            inlateout(reg) ptr => result,
         );
     }
     result
