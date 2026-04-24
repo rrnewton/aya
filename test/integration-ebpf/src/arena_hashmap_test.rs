@@ -68,6 +68,12 @@ static mut BUMP: BumpAllocator = BumpAllocator::new();
 #[unsafe(no_mangle)]
 static mut INITIALIZED: u64 = 0;
 
+/// Volatile global to break compiler tracking of the arena map pointer.
+/// The BPF verifier prohibits pointer arithmetic on map_ptr, so we must
+/// prevent the compiler from using ARENA.as_ptr() for address computations.
+#[unsafe(no_mangle)]
+static mut ARENA_MAP_PTR: *mut c_void = core::ptr::null_mut();
+
 // ── Results map ────────────────────────────────────────────────────────
 
 #[map]
@@ -183,7 +189,11 @@ fn arena_hashmap_test(_ctx: *mut c_void) -> i32 {
         return 0;
     }
 
-    let arena_ptr = ARENA.as_ptr();
+    // Store map pointer into volatile global to break compiler tracking.
+    // Reading it back via volatile prevents the compiler from substituting
+    // the map_ptr literal into address computations.
+    unsafe { core::ptr::write_volatile(&raw mut ARENA_MAP_PTR, ARENA.as_ptr()) };
+    let arena_ptr = unsafe { core::ptr::read_volatile(&raw const ARENA_MAP_PTR) };
     let _ret = unsafe { run_hashmap_test(arena_ptr) };
 
     // Always allow socket creation, even if test failed.
