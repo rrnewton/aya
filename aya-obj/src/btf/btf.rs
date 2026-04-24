@@ -642,7 +642,6 @@ impl Btf {
     /// Encodes the metadata as BTF format.
     ///
     /// Sanitizes types that the kernel rejects during `BPF_BTF_LOAD`:
-    /// - EXTERN FUNCs are replaced with INT placeholders
     /// - Unsupported DATASECs are replaced with INT placeholders
     pub fn to_bytes(&self) -> Vec<u8> {
         // Serialize types, sanitizing problematic entries
@@ -650,10 +649,12 @@ impl Btf {
         for ty in self.types() {
             match ty {
                 BtfType::Func(func) if func.linkage() == FuncLinkage::Extern => {
-                    // Replace EXTERN FUNC with INT (same size: 12 bytes)
-                    let placeholder =
-                        BtfType::Int(Int::new(func.name_offset, 1, IntEncoding::None, 0));
-                    type_buf.extend(placeholder.to_bytes());
+                    // Keep EXTERN FUNCs — the kernel verifier needs them to
+                    // resolve kfunc return types (e.g., bpf_arena_alloc_pages).
+                    // Supported since kernel 5.17. Older kernels that reject
+                    // BTF_FUNC_EXTERN will fail at BTF load time, which is
+                    // handled by the caller.
+                    type_buf.extend(ty.to_bytes());
                 }
                 BtfType::DataSec(d) => {
                     let name = self.string_at(d.name_offset).unwrap_or_default();
