@@ -291,7 +291,7 @@ unsafe fn build_btree(arena_ptr: *mut c_void) -> i64 {
     }
 
     let region_offset = region_raw as u64 - arena_base as u64;
-    core::ptr::write(
+    core::ptr::write_volatile(
         bump_state,
         ArenaBumpState {
             watermark: region_offset,

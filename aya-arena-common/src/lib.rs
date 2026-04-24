@@ -349,7 +349,7 @@ pub unsafe fn arena_slab_init(
     if slot_size < SLAB_MIN_SLOT_SIZE || !slot_size.is_multiple_of(8) {
         return -1;
     }
-    core::ptr::write(
+    core::ptr::write_volatile(
         slab,
         ArenaSlabState {
             bump: ArenaBumpState::new(capacity),
@@ -384,7 +384,7 @@ pub unsafe fn arena_slab_alloc(slab: *mut ArenaSlabState, arena_base: *mut u8) -
         let slot = slot_ptr.resolve(arena_base);
         let next = core::ptr::read(slot.cast::<ArenaPtr<u8>>());
         // Clear the double-free detection magic
-        core::ptr::write(slot.add(8).cast::<u64>(), 0);
+        core::ptr::write_volatile(slot.add(8).cast::<u64>(), 0);
         s.free_head = next;
         s.free_count -= 1;
         return slot_ptr;
@@ -427,9 +427,9 @@ pub unsafe fn arena_slab_free(
     }
 
     // Write the current free_head into the slot (intrusive link)
-    core::ptr::write(slot_raw.cast::<ArenaPtr<u8>>(), s.free_head);
+    core::ptr::write_volatile(slot_raw.cast::<ArenaPtr<u8>>(), s.free_head);
     // Write the double-free detection magic
-    core::ptr::write(magic_ptr, SLAB_FREE_MAGIC);
+    core::ptr::write_volatile(magic_ptr, SLAB_FREE_MAGIC);
 
     // Push slot onto the free list
     s.free_head = slot;
@@ -583,12 +583,12 @@ pub unsafe fn arena_hash_init(
     let mut i: u32 = 0;
     while i < capacity {
         let entry = entries_ptr.add(i as usize);
-        core::ptr::write(entry, ArenaHashEntry::EMPTY);
+        core::ptr::write_volatile(entry, ArenaHashEntry::EMPTY);
         i += 1;
     }
 
     // Write header
-    core::ptr::write(
+    core::ptr::write_volatile(
         header_ptr,
         ArenaHashMap {
             capacity,
@@ -919,7 +919,7 @@ unsafe fn btree_alloc_node(
     match state.alloc(size_of::<BTreeNode>() as u64, align_of::<BTreeNode>() as u64) {
         Some(offset) => {
             let node = arena_base.add(offset as usize).cast::<BTreeNode>();
-            core::ptr::write(
+            core::ptr::write_volatile(
                 node,
                 if leaf {
                     BTreeNode::EMPTY_LEAF
@@ -1044,7 +1044,7 @@ unsafe fn btree_insert_into_leaf(node: *mut BTreeNode, pos: u32, key: u64, value
 /// `map` must point to valid, writable memory for an `ArenaBTreeMap`.
 pub unsafe fn arena_btree_init(map: *mut ArenaBTreeMap) {
     unsafe {
-        core::ptr::write(
+        core::ptr::write_volatile(
             map,
             ArenaBTreeMap {
                 root: ArenaPtr::null(),
@@ -2792,7 +2792,7 @@ mod tests {
         assert!(!slot.is_null());
 
         let ptr = unsafe { slot.resolve(base) };
-        unsafe { core::ptr::write(ptr.cast::<u64>(), 0xDEADBEEF_CAFEBABE) };
+        unsafe { core::ptr::write_volatile(ptr.cast::<u64>(), 0xDEADBEEF_CAFEBABE) };
         let val = unsafe { core::ptr::read(ptr.cast::<u64>()) };
         assert_eq!(val, 0xDEADBEEF_CAFEBABE);
 
@@ -2800,7 +2800,7 @@ mod tests {
         unsafe { arena_slab_free(slab, slot, base) };
         let slot2 = unsafe { arena_slab_alloc(slab, base) };
         assert_eq!(slot2.offset(), slot.offset());
-        unsafe { core::ptr::write(slot2.resolve(base).cast::<u64>(), 42) };
+        unsafe { core::ptr::write_volatile(slot2.resolve(base).cast::<u64>(), 42) };
         assert_eq!(unsafe { core::ptr::read(slot2.resolve(base).cast::<u64>()) }, 42);
     }
 

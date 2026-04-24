@@ -143,7 +143,7 @@ unsafe fn run_btree_test(arena_ptr: *mut c_void) -> i64 {
     // The bump state tracks offsets relative to arena_base, so watermark
     // starts at the region's offset and capacity is watermark + region size.
     let region_offset = region as u64 - arena_base as u64;
-    core::ptr::write(
+    core::ptr::write_volatile(
         bump_state,
         ArenaBumpState {
             watermark: region_offset,
