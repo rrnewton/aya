@@ -174,15 +174,20 @@ pub unsafe fn bump_alloc(
     let lim = unsafe { ptr::read_volatile(&raw const (*bump).lim_memusage) };
     let cur = unsafe { ptr::read_volatile(&raw const (*bump).cur_memusage) };
 
-    let addr = (memory as u64) + off;
-    let padding = round_up(addr, alignment) - addr;
+    // Compute allocation address. Use pointer arithmetic on the arena pointer
+    // (not integer arithmetic) so the BPF verifier maintains arena type tracking.
+    // The verifier requires arena_ptr + scalar, not scalar + arena_ptr.
+    let base = unsafe { (memory as *mut u8).add(off as usize) };
+    let padding = {
+        let addr = base as u64;
+        round_up(addr, alignment) - addr
+    };
     let alloc_bytes = bytes + padding;
 
     // Check if allocation fits in current block.
     if off + alloc_bytes <= max_contig {
         // Fast path: fits in current block.
-        // Use pointer arithmetic on the arena pointer to preserve verifier type.
-        let result = unsafe { (memory as *mut u8).add((off + padding) as usize) as *mut c_void };
+        let result = unsafe { base.add(padding as usize) as *mut c_void };
         let result = cast_kern(result);
         unsafe {
             ptr::write_volatile(&raw mut (*bump).off, off + alloc_bytes);
@@ -213,8 +218,11 @@ pub unsafe fn bump_alloc(
     }
 
     let link_size = size_of::<BlockLink>() as u64;
-    let new_addr = (new_memory as u64) + link_size;
-    let new_padding = round_up(new_addr, alignment) - new_addr;
+    let new_base = unsafe { (new_memory as *mut u8).add(link_size as usize) };
+    let new_padding = {
+        let new_addr = new_base as u64;
+        round_up(new_addr, alignment) - new_addr
+    };
     let new_alloc_bytes = bytes + new_padding;
 
     if new_alloc_bytes + link_size > max_contig {
@@ -223,9 +231,7 @@ pub unsafe fn bump_alloc(
         return ptr::null_mut();
     }
 
-    let result = unsafe {
-        (new_memory as *mut u8).add((link_size + new_padding) as usize) as *mut c_void
-    };
+    let result = unsafe { new_base.add(new_padding as usize) as *mut c_void };
     let result = cast_kern(result);
 
     unsafe {
