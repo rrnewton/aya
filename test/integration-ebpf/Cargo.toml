@@ -161,9 +161,10 @@ path = "src/arena_slab_test.rs"
 name = "arena_btree_test"
 path = "src/arena_btree_test.rs"
 
-[[bin]]
-name = "arena_vanilla_test"
-path = "src/arena_vanilla_test.rs"
+# arena_vanilla_test requires alloc crate (needs -Z build-std=core,alloc)
+# [[bin]]
+# name = "arena_vanilla_test"
+# path = "src/arena_vanilla_test.rs"
 
 [[bin]]
 name = "printk_test"
