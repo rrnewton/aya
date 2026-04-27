@@ -7,6 +7,8 @@
 
 pub mod arena;
 pub mod bump;
+pub mod global_alloc;
 
 pub use arena::{arena_alloc_pages, arena_free_pages, cast_kern, cast_user, NUMA_NO_NODE};
 pub use bump::{bump_alloc, bump_destroy, bump_init, bump_memlimit, BumpAllocator};
+pub use global_alloc::ArenaGlobalAlloc;

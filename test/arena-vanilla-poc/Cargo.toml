@@ -1,0 +1,9 @@
+[package]
+name = "arena-vanilla-poc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aya-arena-common = { path = "../../aya-arena-common" }
+rand = "0.9"

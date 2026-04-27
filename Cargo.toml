@@ -33,6 +33,9 @@ members = [
 
     # arena benchmarks
     "test/arena-bench",
+
+    # arena vanilla data structures PoC
+    "test/arena-vanilla-poc",
 ]
 
 resolver = "2"

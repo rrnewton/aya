@@ -162,6 +162,10 @@ name = "arena_btree_test"
 path = "src/arena_btree_test.rs"
 
 [[bin]]
+name = "arena_vanilla_test"
+path = "src/arena_vanilla_test.rs"
+
+[[bin]]
 name = "printk_test"
 path = "src/printk_test.rs"
 
