@@ -1656,6 +1656,259 @@ where
     }
 }
 
+// ── Safe Userspace Wrappers ──────────────────────────────────────────
+//
+// These types provide safe, lifetime-bound access to arena data structures
+// from userspace. They encapsulate all unsafe pointer resolution behind
+// bounds-checked APIs, reducing the unsafe surface to a single constructor.
+//
+// Gated behind the "userspace" feature since BPF programs operate on raw
+// pointers directly and cannot use these wrappers.
+
+#[cfg(feature = "userspace")]
+mod safe_wrappers {
+    use super::*;
+    use core::marker::PhantomData;
+
+    /// A validated reference to an arena memory region.
+    ///
+    /// Ties the arena base pointer to the lifetime of the owning Arena map,
+    /// and provides bounds-checked pointer resolution.
+    pub struct ArenaRef<'a> {
+        base: *mut u8,
+        len: usize,
+        _lifetime: PhantomData<&'a [u8]>,
+    }
+
+    impl<'a> ArenaRef<'a> {
+        /// Create an `ArenaRef` from a raw base pointer and length.
+        ///
+        /// # Safety
+        ///
+        /// - `base` must point to a valid, mapped arena region of at least `len` bytes.
+        /// - The region must remain valid for lifetime `'a`.
+        /// - No mutable aliases may exist to the region for the duration of `'a`
+        ///   unless access is coordinated (e.g., BPF program has detached).
+        pub unsafe fn from_raw(base: *mut u8, len: usize) -> Self {
+            Self {
+                base,
+                len,
+                _lifetime: PhantomData,
+            }
+        }
+
+        /// Returns the raw base pointer to the arena.
+        pub fn base(&self) -> *mut u8 {
+            self.base
+        }
+
+        /// Returns the length of the arena region in bytes.
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        /// Returns `true` if the arena has zero length.
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        /// Resolve an `ArenaPtr` to a shared reference, with bounds checking.
+        ///
+        /// Returns `None` if the pointer is null or the resolved address
+        /// (including the full `size_of::<T>()`) falls outside the arena.
+        pub fn resolve<T>(&self, ptr: ArenaPtr<T>) -> Option<&'a T> {
+            let offset = ptr.offset()?;
+            let end = (offset as usize).checked_add(core::mem::size_of::<T>())?;
+            if end > self.len {
+                return None;
+            }
+            unsafe { Some(&*self.base.add(offset as usize).cast::<T>()) }
+        }
+
+        /// Resolve an `ArenaPtr` to a mutable reference, with bounds checking.
+        ///
+        /// Returns `None` if the pointer is null or out of bounds.
+        pub fn resolve_mut<T>(&mut self, ptr: ArenaPtr<T>) -> Option<&'a mut T> {
+            let offset = ptr.offset()?;
+            let end = (offset as usize).checked_add(core::mem::size_of::<T>())?;
+            if end > self.len {
+                return None;
+            }
+            unsafe { Some(&mut *self.base.add(offset as usize).cast::<T>()) }
+        }
+    }
+
+    // ArenaRef is Send/Sync iff the underlying arena is — which it is,
+    // since arena memory is a plain mmap'd region.
+    unsafe impl Send for ArenaRef<'_> {}
+    unsafe impl Sync for ArenaRef<'_> {}
+
+    /// Safe read-only view of an [`ArenaHashMap`] in arena memory.
+    ///
+    /// Wraps the raw hash map functions so that userspace code can query
+    /// the map without writing any `unsafe` blocks.
+    pub struct ArenaHashMapRef<'a> {
+        header: *const ArenaHashMap,
+        arena: &'a ArenaRef<'a>,
+    }
+
+    impl<'a> ArenaHashMapRef<'a> {
+        /// Create a safe view from a validated `ArenaRef` and an offset
+        /// to the `ArenaHashMap` header within the arena.
+        ///
+        /// Returns `None` if the offset is out of bounds.
+        pub fn new(arena: &'a ArenaRef<'a>, header_offset: u64) -> Option<Self> {
+            let _header = arena.resolve::<ArenaHashMap>(ArenaPtr::from_offset(header_offset))?;
+            Some(Self {
+                header: _header as *const ArenaHashMap,
+                arena,
+            })
+        }
+
+        /// Look up a key. Returns `Some(value)` if found.
+        pub fn get(&self, key: u64) -> Option<u64> {
+            unsafe {
+                let val = arena_hash_get(self.header, key, self.arena.base());
+                if val.is_null() {
+                    None
+                } else {
+                    Some(*val)
+                }
+            }
+        }
+
+        /// Number of occupied entries.
+        pub fn count(&self) -> u32 {
+            unsafe { (*self.header).count }
+        }
+
+        /// Returns `true` if the map contains no entries.
+        pub fn is_empty(&self) -> bool {
+            self.count() == 0
+        }
+
+        /// Capacity (number of buckets).
+        pub fn capacity(&self) -> u32 {
+            unsafe { (*self.header).capacity }
+        }
+
+        /// Call `f(key, value)` for each occupied entry.
+        pub fn for_each<F: FnMut(u64, u64)>(&self, f: F) {
+            unsafe {
+                arena_hash_for_each(self.header, self.arena.base(), f);
+            }
+        }
+
+        /// Returns `true` if the given key is present.
+        pub fn contains_key(&self, key: u64) -> bool {
+            self.get(key).is_some()
+        }
+    }
+
+    /// Safe read-only view of an [`ArenaBTreeMap`] in arena memory.
+    pub struct ArenaBTreeMapRef<'a> {
+        header: *const ArenaBTreeMap,
+        arena: &'a ArenaRef<'a>,
+    }
+
+    impl<'a> ArenaBTreeMapRef<'a> {
+        /// Create a safe view from a validated `ArenaRef` and an offset
+        /// to the `ArenaBTreeMap` header within the arena.
+        ///
+        /// Returns `None` if the offset is out of bounds.
+        pub fn new(arena: &'a ArenaRef<'a>, header_offset: u64) -> Option<Self> {
+            let _header =
+                arena.resolve::<ArenaBTreeMap>(ArenaPtr::from_offset(header_offset))?;
+            Some(Self {
+                header: _header as *const ArenaBTreeMap,
+                arena,
+            })
+        }
+
+        /// Look up a key. Returns `Some(value)` if found.
+        pub fn get(&self, key: u64) -> Option<u64> {
+            unsafe {
+                let val = arena_btree_get(self.header, key, self.arena.base());
+                if val.is_null() {
+                    None
+                } else {
+                    Some(*val)
+                }
+            }
+        }
+
+        /// Number of key-value pairs in the tree.
+        pub fn count(&self) -> u64 {
+            unsafe { (*self.header).count }
+        }
+
+        /// Returns `true` if the tree is empty.
+        pub fn is_empty(&self) -> bool {
+            self.count() == 0
+        }
+
+        /// Current tree height (0 = empty).
+        pub fn height(&self) -> u32 {
+            unsafe { (*self.header).height }
+        }
+
+        /// Call `f(key, value)` for each entry in sorted order.
+        pub fn for_each<F: FnMut(u64, u64)>(&self, f: F) {
+            unsafe {
+                arena_btree_for_each(self.header, self.arena.base(), f);
+            }
+        }
+
+        /// Returns `true` if the given key is present.
+        pub fn contains_key(&self, key: u64) -> bool {
+            self.get(key).is_some()
+        }
+    }
+
+    /// Safe read-only view of an [`ArenaSlabState`] in arena memory.
+    pub struct ArenaSlabRef<'a> {
+        state: &'a ArenaSlabState,
+    }
+
+    impl<'a> ArenaSlabRef<'a> {
+        /// Create a safe view from a validated `ArenaRef` and an offset
+        /// to the `ArenaSlabState` within the arena.
+        ///
+        /// Returns `None` if the offset is out of bounds.
+        pub fn new(arena: &'a ArenaRef<'a>, offset: u64) -> Option<Self> {
+            let state = arena.resolve::<ArenaSlabState>(ArenaPtr::from_offset(offset))?;
+            Some(Self { state })
+        }
+
+        /// Get allocator statistics without any unsafe.
+        pub fn stats(&self) -> ArenaSlabStats {
+            ArenaSlabStats {
+                total_allocated: self.state.total_allocated,
+                free_count: self.state.free_count,
+                in_use: self.state.total_allocated - self.state.free_count,
+            }
+        }
+
+        /// Slot size in bytes.
+        pub fn slot_size(&self) -> u32 {
+            self.state.slot_size
+        }
+
+        /// Current bump allocator watermark.
+        pub fn watermark(&self) -> u64 {
+            self.state.bump.watermark
+        }
+
+        /// Total capacity of the underlying arena region.
+        pub fn capacity(&self) -> u64 {
+            self.state.bump.capacity
+        }
+    }
+}
+
+#[cfg(feature = "userspace")]
+pub use safe_wrappers::*;
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;
@@ -3735,5 +3988,368 @@ mod concurrency_tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+}
+
+// ── Safe wrapper tests ──────────────────────────────────────────────
+
+#[cfg(all(test, feature = "userspace"))]
+mod safe_wrapper_tests {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use super::*;
+    use core::mem;
+
+    fn make_arena(size: usize) -> Vec<u8> {
+        vec![0u8; size]
+    }
+
+    // ── ArenaRef tests ──────────────────────────────────────────────
+
+    #[test]
+    fn arena_ref_resolve_basic() {
+        let mut buf = make_arena(4096);
+        let base = buf.as_mut_ptr();
+
+        // Write a known value at offset 0
+        let val: u64 = 0xDEAD_BEEF;
+        unsafe { core::ptr::write(base.cast::<u64>(), val) };
+
+        let arena = unsafe { ArenaRef::from_raw(base, 4096) };
+        let resolved = arena.resolve::<u64>(ArenaPtr::from_offset(0)).unwrap();
+        assert_eq!(*resolved, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn arena_ref_resolve_null_returns_none() {
+        let mut buf = make_arena(4096);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 4096) };
+        let result = arena.resolve::<u64>(ArenaPtr::<u64>::null());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn arena_ref_resolve_out_of_bounds_returns_none() {
+        let mut buf = make_arena(64);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 64) };
+        // Try to resolve at offset 60 for a u64 (needs 8 bytes: 60..68 > 64)
+        let result = arena.resolve::<u64>(ArenaPtr::from_offset(60));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn arena_ref_resolve_exact_boundary() {
+        let mut buf = make_arena(64);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 64) };
+        // offset 56 + 8 bytes = 64 = len, should succeed
+        let result = arena.resolve::<u64>(ArenaPtr::from_offset(56));
+        assert!(result.is_some());
+        // offset 57 + 8 bytes = 65 > 64, should fail
+        let result = arena.resolve::<u64>(ArenaPtr::from_offset(57));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn arena_ref_resolve_mut() {
+        let mut buf = make_arena(4096);
+        let base = buf.as_mut_ptr();
+        let mut arena = unsafe { ArenaRef::from_raw(base, 4096) };
+
+        let val = arena
+            .resolve_mut::<u64>(ArenaPtr::from_offset(0))
+            .unwrap();
+        *val = 42;
+
+        let val = arena.resolve::<u64>(ArenaPtr::from_offset(0)).unwrap();
+        assert_eq!(*val, 42);
+    }
+
+    #[test]
+    fn arena_ref_len_and_is_empty() {
+        let mut buf = make_arena(4096);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 4096) };
+        assert_eq!(arena.len(), 4096);
+        assert!(!arena.is_empty());
+
+        let empty = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 0) };
+        assert!(empty.is_empty());
+    }
+
+    // ── ArenaHashMapRef tests ───────────────────────────────────────
+
+    fn setup_hash_map(capacity: u32) -> (Vec<u8>, u64) {
+        let header_size = mem::size_of::<ArenaHashMap>();
+        let entry_size = mem::size_of::<ArenaHashEntry>();
+        let total = header_size + entry_size * capacity as usize;
+        let mut buf = vec![0u8; total];
+        let base = buf.as_mut_ptr();
+        let header_ptr = base.cast::<ArenaHashMap>();
+        let entries_ptr = unsafe { base.add(header_size) }.cast::<ArenaHashEntry>();
+        let ret = unsafe { arena_hash_init(header_ptr, entries_ptr, capacity, base) };
+        assert_eq!(ret, 0);
+        (buf, 0) // header is at offset 0
+    }
+
+    #[test]
+    fn safe_hashmap_empty() {
+        let (mut buf, offset) = setup_hash_map(16);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), buf.len()) };
+        let map = ArenaHashMapRef::new(&arena, offset).unwrap();
+
+        assert!(map.is_empty());
+        assert_eq!(map.count(), 0);
+        assert_eq!(map.capacity(), 16);
+        assert_eq!(map.get(42), None);
+        assert!(!map.contains_key(42));
+    }
+
+    #[test]
+    fn safe_hashmap_insert_and_get() {
+        let (mut buf, offset) = setup_hash_map(16);
+        let base = buf.as_mut_ptr();
+
+        // Insert via unsafe API (simulating BPF write)
+        unsafe {
+            arena_hash_insert(base.cast(), 42, 100, base);
+            arena_hash_insert(base.cast(), 99, 200, base);
+        }
+
+        let arena = unsafe { ArenaRef::from_raw(base, buf.len()) };
+        let map = ArenaHashMapRef::new(&arena, offset).unwrap();
+
+        assert_eq!(map.count(), 2);
+        assert_eq!(map.get(42), Some(100));
+        assert_eq!(map.get(99), Some(200));
+        assert_eq!(map.get(1), None);
+        assert!(map.contains_key(42));
+        assert!(!map.contains_key(1));
+    }
+
+    #[test]
+    fn safe_hashmap_for_each() {
+        let (mut buf, offset) = setup_hash_map(16);
+        let base = buf.as_mut_ptr();
+
+        unsafe {
+            arena_hash_insert(base.cast(), 10, 100, base);
+            arena_hash_insert(base.cast(), 20, 200, base);
+            arena_hash_insert(base.cast(), 30, 300, base);
+        }
+
+        let arena = unsafe { ArenaRef::from_raw(base, buf.len()) };
+        let map = ArenaHashMapRef::new(&arena, offset).unwrap();
+
+        let mut pairs = Vec::new();
+        map.for_each(|k, v| pairs.push((k, v)));
+        pairs.sort();
+        assert_eq!(pairs, vec![(10, 100), (20, 200), (30, 300)]);
+    }
+
+    #[test]
+    fn safe_hashmap_out_of_bounds_returns_none() {
+        let (mut buf, _) = setup_hash_map(16);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 4) }; // too small
+        let map = ArenaHashMapRef::new(&arena, 0);
+        assert!(map.is_none());
+    }
+
+    // ── ArenaBTreeMapRef tests ──────────────────────────────────────
+
+    fn setup_btree() -> (Vec<u8>, u64, u64) {
+        // Layout: [ArenaBTreeMap header][ArenaBumpState][...node space...]
+        let header_size = mem::size_of::<ArenaBTreeMap>();
+        let bump_size = mem::size_of::<ArenaBumpState>();
+        let node_space = 64 * 1024; // 64KB for nodes
+        let total = header_size + bump_size + node_space;
+        let mut buf = vec![0u8; total];
+        let base = buf.as_mut_ptr();
+        let map_ptr = base.cast::<ArenaBTreeMap>();
+        let bump_ptr = unsafe { base.add(header_size) }.cast::<ArenaBumpState>();
+
+        unsafe {
+            arena_btree_init(map_ptr);
+            // Init bump allocator starting after the header+bump region
+            let data_start = (header_size + bump_size) as u64;
+            core::ptr::write(
+                bump_ptr,
+                ArenaBumpState::new(total as u64 - data_start),
+            );
+            // Adjust bump watermark base: bump allocates relative offsets,
+            // but we need absolute offsets from arena base.
+            // Actually the bump alloc returns offsets from 0, we need to add data_start.
+            // Let's just set the bump capacity to cover the node space,
+            // and the arena base for btree ops will be base, with bump starting at data_start.
+            // The btree functions take arena_base directly.
+            // Re-init: bump manages offsets starting from its own perspective.
+            // We need to shift. Let me just use a large flat buffer approach:
+            // Put map header at offset 0, bump at offset header_size,
+            // and tell bump its capacity covers from (header_size+bump_size) to end.
+            (*bump_ptr).watermark = data_start;
+            (*bump_ptr).capacity = total as u64;
+        }
+
+        (buf, 0, header_size as u64) // (buffer, map_offset, bump_offset)
+    }
+
+    #[test]
+    fn safe_btree_empty() {
+        let (mut buf, map_offset, _) = setup_btree();
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), buf.len()) };
+        let tree = ArenaBTreeMapRef::new(&arena, map_offset).unwrap();
+
+        assert!(tree.is_empty());
+        assert_eq!(tree.count(), 0);
+        assert_eq!(tree.height(), 0);
+        assert_eq!(tree.get(42), None);
+    }
+
+    #[test]
+    fn safe_btree_insert_and_get() {
+        let (mut buf, map_offset, bump_offset) = setup_btree();
+        let base = buf.as_mut_ptr();
+        let map_ptr = base.cast::<ArenaBTreeMap>();
+        let bump_ptr = unsafe { base.add(bump_offset as usize) }.cast::<ArenaBumpState>();
+
+        unsafe {
+            arena_btree_insert(map_ptr, bump_ptr, 50, 500, base);
+            arena_btree_insert(map_ptr, bump_ptr, 10, 100, base);
+            arena_btree_insert(map_ptr, bump_ptr, 90, 900, base);
+        }
+
+        let arena = unsafe { ArenaRef::from_raw(base, buf.len()) };
+        let tree = ArenaBTreeMapRef::new(&arena, map_offset).unwrap();
+
+        assert_eq!(tree.count(), 3);
+        assert_eq!(tree.get(50), Some(500));
+        assert_eq!(tree.get(10), Some(100));
+        assert_eq!(tree.get(90), Some(900));
+        assert_eq!(tree.get(42), None);
+        assert!(tree.contains_key(50));
+        assert!(!tree.contains_key(42));
+    }
+
+    #[test]
+    fn safe_btree_for_each_sorted() {
+        let (mut buf, map_offset, bump_offset) = setup_btree();
+        let base = buf.as_mut_ptr();
+        let map_ptr = base.cast::<ArenaBTreeMap>();
+        let bump_ptr = unsafe { base.add(bump_offset as usize) }.cast::<ArenaBumpState>();
+
+        unsafe {
+            for i in (1..=20).rev() {
+                arena_btree_insert(map_ptr, bump_ptr, i, i * 10, base);
+            }
+        }
+
+        let arena = unsafe { ArenaRef::from_raw(base, buf.len()) };
+        let tree = ArenaBTreeMapRef::new(&arena, map_offset).unwrap();
+
+        let mut keys = Vec::new();
+        tree.for_each(|k, _v| keys.push(k));
+        let expected: Vec<u64> = (1..=20).collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn safe_btree_out_of_bounds_returns_none() {
+        let (mut buf, _, _) = setup_btree();
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 4) }; // too small
+        let tree = ArenaBTreeMapRef::new(&arena, 0);
+        assert!(tree.is_none());
+    }
+
+    // ── ArenaSlabRef tests ──────────────────────────────────────────
+
+    fn setup_slab(slot_size: u32) -> (Vec<u8>, u64) {
+        let slab_size = mem::size_of::<ArenaSlabState>();
+        let capacity = 4096usize;
+        let total = slab_size + capacity;
+        let mut buf = vec![0u8; total];
+        let base = buf.as_mut_ptr();
+        let slab_ptr = base.cast::<ArenaSlabState>();
+
+        unsafe {
+            arena_slab_init(slab_ptr, capacity as u64, slot_size);
+        }
+
+        (buf, 0)
+    }
+
+    #[test]
+    fn safe_slab_stats_initial() {
+        let (mut buf, offset) = setup_slab(64);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), buf.len()) };
+        let slab = ArenaSlabRef::new(&arena, offset).unwrap();
+
+        let stats = slab.stats();
+        assert_eq!(stats.total_allocated, 0);
+        assert_eq!(stats.free_count, 0);
+        assert_eq!(stats.in_use, 0);
+        assert_eq!(slab.slot_size(), 64);
+        assert_eq!(slab.capacity(), 4096);
+        assert_eq!(slab.watermark(), 0);
+    }
+
+    #[test]
+    fn safe_slab_stats_after_alloc() {
+        let (mut buf, offset) = setup_slab(64);
+        let base = buf.as_mut_ptr();
+        let slab_ptr = base.cast::<ArenaSlabState>();
+        let arena_base = unsafe { base.add(mem::size_of::<ArenaSlabState>()) };
+
+        unsafe {
+            arena_slab_alloc(slab_ptr, arena_base);
+            arena_slab_alloc(slab_ptr, arena_base);
+        }
+
+        let arena = unsafe { ArenaRef::from_raw(base, buf.len()) };
+        let slab = ArenaSlabRef::new(&arena, offset).unwrap();
+
+        let stats = slab.stats();
+        assert_eq!(stats.total_allocated, 2);
+        assert_eq!(stats.in_use, 2);
+        assert_eq!(stats.free_count, 0);
+    }
+
+    #[test]
+    fn safe_slab_out_of_bounds_returns_none() {
+        let (mut buf, _) = setup_slab(64);
+        let arena = unsafe { ArenaRef::from_raw(buf.as_mut_ptr(), 4) }; // too small
+        let slab = ArenaSlabRef::new(&arena, 0);
+        assert!(slab.is_none());
+    }
+
+    // ── Integration: demonstrate zero-unsafe userspace reads ────────
+
+    #[test]
+    fn zero_unsafe_hashmap_read_demo() {
+        // This test demonstrates the intended usage pattern:
+        // 1. Unsafe: one-time arena construction + BPF data population
+        // 2. Safe: all subsequent reads go through safe wrappers
+
+        // --- Setup (simulates BPF writing to arena) ---
+        let (mut buf, offset) = setup_hash_map(64);
+        let base = buf.as_mut_ptr();
+        unsafe {
+            for i in 0..10u64 {
+                arena_hash_insert(base.cast(), i, i * i, base);
+            }
+        }
+
+        // --- Userspace reads: zero unsafe from here on ---
+        let arena = unsafe { ArenaRef::from_raw(base, buf.len()) };
+        let map = ArenaHashMapRef::new(&arena, offset).unwrap();
+
+        // All of these are safe calls
+        assert_eq!(map.count(), 10);
+        for i in 0..10u64 {
+            assert_eq!(map.get(i), Some(i * i));
+        }
+        assert_eq!(map.get(999), None);
+
+        let mut sum = 0u64;
+        map.for_each(|_k, v| sum += v);
+        assert_eq!(sum, (0..10u64).map(|i| i * i).sum::<u64>());
     }
 }

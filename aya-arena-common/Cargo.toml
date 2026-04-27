@@ -10,6 +10,7 @@ name = "aya_arena_common"
 
 [features]
 default = []
+userspace = []
 
 [dependencies]
 
